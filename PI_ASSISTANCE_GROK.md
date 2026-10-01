@@ -46,6 +46,7 @@ Raspberry Pi OS owns `/boot/firmware/config.txt`, HDMI, the panel, and the ALSA 
 ```
 /home/antonio/grok-assistant/
   assistant.py          the running program
+  pi_extra.py           account agents, the identification take, and the voice-lane room
   wifi-boot.py          waits for the network, then starts the assistant
   config.json
   requirements.txt
@@ -141,11 +142,13 @@ A print from before this change may still be a list of vectors and may have no `
 2. Two words in a row, such as Jose Antonio, are one person.
 3. If that voice or that name is already saved: “Esta voz ya la tengo como NOMBRE. ¿Repito la identificación?” Yes replaces that person and does not create another. No returns to “Di otro nombre.”
 4. If the name is new: “No tengo a NOMBRE. ¿Lo guardo como otra persona?” Yes stores it. No asks for another name.
-5. It then speaks sixteen phrases, once each, and waits for the repeat. The first line is “Grabaré 16 frases una sola vez. El sonido vale para todos los motores. 1 de 16. hola grok”. Later lines are “2 de 16. estás ahí”, and so on.
+5. It then speaks sixteen phrases, once each, and waits for the repeat. Before the first phrase it says “Grabaré 16 frases una sola vez. Guardo el sonido en crudo, sin comprobar las palabras. El sonido vale para todos los motores. Habla después del pitido, y espera el segundo pitido.” Each phrase is then “N de 16. FRASE”, including the first.
 6. The phrases, in order: `hola grok`, `estás ahí`, `qué hora es`, `pon una canción`, `sube el volumen`, `baja el volumen`, `para la música`, `buenos días`, `hasta luego`, `qué día es hoy`, `me escuchas`, `gracias`, `abre la sesión`, `cuenta hasta tres`, `cómo estás`, `dime la hora`.
-7. Three empty takes in a row abort with “No oigo el micrófono. Lo dejo.”
-8. Afterward the takes must be one voice. Two takes match when their cosine is at least 0.55. The largest group in which every pair passes is kept. It must contain at least 12 takes. Anything outside that group is dropped. If no group reaches 12, nothing is saved and the person who was already stored stays as they were: “Estas tomas no son una sola voz. No guardo a otra persona.”
-9. When the group is good, only those takes are saved, `locked` is set to that name, and each installed engine is scored from the wavs. “Listo, NOMBRE. El sonido queda guardado y vale para todos los motores. Valoro cada uno.” If some takes were dropped: “Guardo N de 16.”
+7. Each take uses the capture device that is already open. It does not open a second input. It pauses a tenth of a second, drops audio already in the buffer, and starts reading again as an 880 Hz beep of 140 ms begins. It does not wait for that beep to finish. When the take ends, the microphone is no longer read and a 494 Hz beep of 220 ms plays. Both tones go out through the playback device the operating system is already using. Normal conversation does not beep, and its silence time stays the configured 3.5 seconds.
+8. The take closes on energy, not on the words. A block counts as voice when its RMS is above 0.004. The take needs 0.8 seconds of voice, then 1.0 second of silence, and it also closes at 8 seconds of voice. The whole wait, including the reaction, is 12 seconds. If no audio arrives, that is silence. The bottom line may show `DI:` and `OI:` while the words grow. Those words do not accept or reject the take. The file in `raw/` stores the phrase that was requested.
+9. Samples plus a CampPlus vector are kept even when the text is empty or is a different phrase. Empty text with samples is logged as `huella: sonido guardado · ETIQUETA`. Any non-empty text is logged as `huella: TEXTO · ETIQUETA`. No samples is `huella: silencio · ETIQUETA` and is a failure. Text with no vector is spoken back: “He oído: TEXTO. No he cogido la huella. Repite.” and the same phrase is asked again. Three failures in a row stop. With text: “He oído: TEXTO. No he cogido la huella. Lo dejo.” Without text: “No oigo el micrófono. Lo dejo.” A kept take sets the failure count back to zero.
+10. Afterward the takes must be one voice. Two takes match when their cosine is at least 0.55. The largest group in which every pair passes is kept. It must contain at least 12 takes. Anything outside that group is dropped. If no group reaches 12, nothing is saved and the person who was already stored stays as they were: “Estas tomas no son una sola voz. No guardo a otra persona.”
+11. When the group is good, only those takes are saved, `locked` is set to that name, and each installed engine is scored from the wavs. “Listo, NOMBRE. El sonido queda guardado y vale para todos los motores. Valoro cada uno.” If some takes were dropped: “Guardo N de 16.”
 
 Scoring does not ask the person to speak again. One engine is loaded at a time, each wav is transcribed, and the model is unloaded. A phrase of three words or fewer is a hit only when every word is present, in order. Accents are not required. One inserted, deleted, or substituted character still counts. A phrase of four or more words may miss one word. Extra heard words may be skipped. `hits` and `total` are the kept takes. An engine’s percentage is the sum of hits across every person divided by the sum of totals, rounded to an integer.
 
@@ -194,13 +197,19 @@ All under `/home/antonio/.config/grok-assistant/`:
 | `wait-index` | next waiting line in `waits-es.txt` |
 | `volume` | Playback level in percent, 0–100, on the OS default mixer |
 | `speakers.json` | mode 600. People as a dict, CampPlus prints or legacy prints, scores, `last`, `greet_count`, and `locked` |
-| `active-agent` | path of the Grok agent in use, if any |
+| `active-agent` | name of the Grok agent in use, if any. The CLI receives the markdown path |
+| `agent-state.json` | local uuid for each opened agent. The account is not asked for an id |
+| `account-agents/` | copy of the account’s agents, refreshed in the background at startup |
 | `sessions` | local sessions, mode 600 |
 | `raw/<slug>/*.wav` | enrollment audio for scoring. Not inside `speakers.json`. Not in the repository |
 
 Named sessions do not expire. The shared session lasts 24 hours and then a new id is created. Do not delete `~/.grok/sessions/` for the coding session. Cleanup of orphan voice sessions must stay inside the voice working directory.
 
-Agents are markdown files in `~/.grok/agents/<name>.md`. Creating one asks for the spoken admin key. Opening one passes `--agent` to the Grok CLI. `cerrar agente` leaves the agent and stays in the talk. `cierra conversación` ends the talk and does not change the session.
+`listar agentes` speaks the bare names from three places. The same name, ignoring case, keeps the later one. First `~/.grok/bundled/agents/*.md` (on this account `explore`, `plan`, and `general-purpose`). Then the copy in `account-agents/`. Then `~/.grok/agents/*.md`, which wins. The spoken line is “Tengo explore, general-purpose, plan.” When every name comes from the bundle or the account copy, it adds “Esos salen de la cuenta.” When there are none: “No hay agentes.” Personas, roles, and the chat modes Auto, Fast, Expert, Heavy, and Build are not agents.
+
+Creating an agent still writes a markdown file in `~/.grok/agents`, asks for the spoken admin key, and does not open it. Opening one passes `--agent` and the markdown path to the Grok CLI. The id stored on the Pi is a uuid created here. `cerrar agente` returns to the normal assistant and does not delete the file. A session stays the local notebook.
+
+At startup, after the hello is not delayed, a background read copies the account agents. It asks `https://cli-chat-proxy.grok.com/v1/subagents/bundle` for the `agents` object and `https://grok.com/rest/user-settings` for `agentCustomizations`. A customization with the same name replaces the bundle entry. The token stays in `~/.grok/auth.json` and is not written to the log or this file. A failure or an empty body leaves the previous copy and the bundled files untouched. A response that contains agents replaces the copy: each file is written as `.md.tmp` and then renamed, and copy files that are no longer returned are deleted. The filename keeps letters, digits, dot, hyphen, and underscore, at most 80 characters. If nothing remains, the file is `agente.md`.
 
 ## Boot order
 
@@ -230,7 +239,7 @@ While music is audible the microphone is off. The buttons are `PAUSA` / `SEGUIR`
 
 ## What the running program does
 
-The rules of the talk below are what this Pi runs. They are implemented in `assistant.py`, not in a tray app. The desktop tray app is the separate repository `grok_assistant`.
+The rules of the talk below are what this Pi runs. They are implemented in `assistant.py` and `pi_extra.py`, not in a tray app. The desktop tray app is the separate repository `grok_assistant`.
 
 Wake, with no cloud call and no search: `hola grok` (and close mishearings such as `hola grok` cut short, `hola grop`, `pola grove`), a short `hola` on its own, or `¿estás ahí, Grok?` / `Grok, ¿estás ahí?`. The answer is `Hola.` or `Sí, aquí estoy.` The words that came with the wake are not sent anywhere. The assistant then waits.
 
@@ -256,11 +265,13 @@ Normal questions use Grok with `web_search` and `web_fetch`, at most 4 turns. Wh
 
 The first boot line comes from `hellos-es.txt`, in order, one per start.
 
+Outside test mode, a finished phrase is read a second time with Whisper base when that model is installed, otherwise with Whisper pequeño. The point is an English name that the Spanish ear dropped. The startup log, not spoken, is `fuera de la prueba, releo cada frase con ETIQUETA para guardar los nombres en inglés`. A reread that is a single token, such as `1.0`, does not replace a real phrase. `me escuchas`, `me oyes`, and `estás ahí` are not read again. A reread that would drop a wake, a `comando`, a song request, a goodbye, or a yes or no is ignored, so the order the selected engine already heard still runs. In test mode the phrase stays the selected engine’s transcript, and that engine’s name is written under the heard line. Nothing in this second reading leaves the Pi.
+
 ## Check that the copy matches
 
 - `systemctl is-enabled wifi-boot` prints `enabled`. `grok-assistant` prints `disabled` and is inactive until Wi-Fi boot or a manual start. There is no service in this project that configures the screen or the sound card.
 - `arecord -L` shows a default capture device when the operating system has a microphone.
-- The journal line `listening on default` appears when the OS has a capture device, then `reconocedor activo: Kroko`, `voz activa: Dave, España`, and `motor escucha: Kroko. huellas combinadas: aún no hay porcentajes.` until a sixteen-phrase recording has been scored.
+- The journal line `listening on default` appears when the OS has a capture device, then `reconocedor activo: Kroko`, `voz activa: Dave, España`, and `motor escucha: Kroko. huellas combinadas: aún no hay porcentajes.` until a sixteen-phrase recording has been scored. With Whisper base installed, the journal also has `fuera de la prueba, releo cada frase con Whisper base para guardar los nombres en inglés`.
 - The panel shows the command list, including personalidad and the sixteen-phrase enrollment line, `TEMP` from the CPU, and the bottom line changes from `(silencio)` to `escuchando…` when someone speaks.
 - `hola` gets `Hola.` and does not call the network.
 - `comando identifica mi voz` asks “¿Cómo te llamas?”, confirms a saved voice or a new name, speaks sixteen phrases once, and keeps a group of at least 12 that match at cosine 0.55. It writes CampPlus prints and wavs, sets `locked`, and scores the installed engines. After that, another voice saying `hola` is ignored. Only the locked voice can identify again.

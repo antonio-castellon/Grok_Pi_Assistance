@@ -37,7 +37,7 @@ Say `comando` and then the line.
 | Say | What happens |
 |---|---|
 | SESION abrir, crear, borrar NOMBRE, listar, cerrar | Local sessions. Creating and deleting ask for sí or no. `cerrar sesión` inside a talk returns the screen to ESPERANDO. |
-| AGENTE abrir, crear NOMBRE, listar, cerrar | Cloud agents. Creating one asks for the administrator key. |
+| AGENTE abrir, crear NOMBRE, listar, cerrar | Agents from the account and from this Pi. Creating one asks for the administrator key and does not open it. |
 | modo administrador | Asks for the spoken key, then stays in administrator mode for five minutes. |
 | lista las personas | Administrator only. Speaks the saved names. |
 | borra NOMBRE | Administrator only. Asks sí or no, then deletes that person, their voice print, and their recordings. |
@@ -51,7 +51,7 @@ Say `comando` and then the line.
 | pon la canción X | Plays the audio of a YouTube match. The microphone stays off while it is audible. |
 | para la música | Stops the song. |
 | apaga el dispositivo | Asks «¿Apago el dispositivo? Di sí o no.» Only a yes from the locked voice powers the Pi off. |
-| prueba | Writes what it hears and runs nothing, until you say `salir`. |
+| prueba | Writes what the selected engine hears, and the engine’s name under it. Runs nothing, until you say `salir`. |
 | identifica mi voz | Records this person. Sixteen phrases, once. |
 
 `ayuda` shows this list again and speaks a short reminder. It does not require administrator mode.
@@ -60,7 +60,7 @@ Say `comando` and then the line.
 
 `comando identifica mi voz` is spoken, so you do not have to read the panel. It asks «¿Cómo te llamas?» Two words, such as Jose Antonio, are one person. A saved voice or a saved name is replaced only after a yes. A new name is stored only after a yes. `salir` cancels at any moment.
 
-It then speaks sixteen phrases, one time each, and waits for you to repeat each one. The bottom line shows `DI:` for the phrase and `OI:` for what it heard. The words do not have to match. What is kept is the sound.
+It then says it will record sixteen phrases once, that it keeps the raw sound without checking the words, and that you should speak after the beep and wait for the second beep. Each phrase follows as “1 de 16. hola grok”, then “2 de 16. estás ahí”, and so on. A high beep starts the take. A low beep ends it. Speak after the first and wait for the second. The bottom line shows `DI:` for the phrase and `OI:` for what it heard. The words do not have to match. What is kept is the sound. If it hears words but cannot take the voice print, it asks for that same phrase again. Three misses in a row stop.
 
 When it finishes, that name is the only voice it will hear: the wake, every `comando`, yes and no, and the open talk. Someone else saying «hola grok» gets nothing. Only that voice can identify again. Other saved names stay in the file. An administrator can list them or delete one.
 
@@ -71,6 +71,10 @@ Until the first recording, no voice is locked, so the first `identifica mi voz` 
 **Voices.** Dave, España is voice 1. The list continues through Spain, Mexico, and Argentina. The active number is stored on the Pi and is not reset when the program starts.
 
 **Listening engines.** Kroko writes the words while you are speaking. The others wait until you pause, then close the phrase. With no scores yet, startup uses Kroko. After a recording, the installed engine with the best score is chosen at the next start. Whisper small can be asked for by name. It is not chosen by itself. There is no percentage on the screen. The number is only in the journal.
+
+Outside test mode, each finished phrase is read again on the Pi with Whisper base, or with Whisper pequeño when base is not installed. That second reading is there so an English name is not lost. A reread that is only one token, such as “1.0”, does not replace a real phrase. «me escuchas», «me oyes», and «estás ahí» are not read again. In test mode the line stays what the selected engine heard, and the engine’s name is shown under it.
+
+**Agents.** `comando listar agentes` speaks the bare names it can open, from the signed-in account and from markdown files on this Pi. A local file with the same name wins. `comando abrir agente explore` opens that file. Creating one asks for the administrator key and leaves it closed. `comando cerrar agente` returns to the normal assistant and does not delete the file.
 
 **Personalities.** Eight fixed people, in `personalities.json`. Empty means the usual assistant. The chosen person changes the tone of the spoken answer. It does not change the command list, and the assistant does not announce which person is in use. A ninth personality cannot be created by talking.
 
