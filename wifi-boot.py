@@ -73,23 +73,24 @@ def load_psf(path: str) -> tuple[int, int, dict[int, bytes]]:
 
 
 def panel_fb() -> str:
-    graphics = Path("/sys/class/graphics")
-    for node in sorted(graphics.glob("fb[0-9]*")):
-        try:
-            name = (node / "name").read_text(encoding="ascii", errors="replace").lower()
-        except OSError:
-            continue
-        if "ili9486" in name or "piscreen" in name:
-            return node.name
-    return "fb0"
+    """The framebuffer the operating system assigned. fb0 is that console."""
+    if Path("/sys/class/graphics/fb0").is_dir():
+        return "fb0"
+    found = sorted(Path("/sys/class/graphics").glob("fb[0-9]*"))
+    return found[0].name if found else "fb0"
 
 
-def panel_rotation() -> int:
+def _axis_limits(fd: int, code: int) -> tuple[int, int]:
+    import fcntl
+
     try:
-        raw = open("/proc/device-tree/soc/spi@7e204000/piscreen@0/rotate", "rb").read()
-        return int.from_bytes(raw[:4], "big")
+        raw = fcntl.ioctl(fd, 0x80184540 + code, b"\0" * 24)
     except OSError:
-        return 180
+        return 0, 1
+    _value, lo, hi, _fuzz, _flat, _resolution = struct.unpack("6i", raw[:24])
+    if hi <= lo:
+        return 0, 1
+    return lo, hi
 
 
 def touch_device() -> str | None:
@@ -107,7 +108,7 @@ def touch_device() -> str | None:
         finally:
             os.close(fd)
         label = name.split(b"\0", 1)[0]
-        if b"ADS7846" in label or b"Touchscreen" in label:
+        if b"touchscreen" in label.lower():
             return str(node)
     return None
 
@@ -229,7 +230,9 @@ class Panel:
         self.font_w, self.font_h, self.glyphs = load_psf(FONT)
         fd = os.open(f"/dev/{self.fb_name}", os.O_RDWR)
         self.mem = mmap.mmap(fd, self.stride * self.height, mmap.MAP_SHARED, mmap.PROT_WRITE)
-        self.rotation = panel_rotation()
+        self.rotation = 0
+        self.touch_x = (0, 1)
+        self.touch_y = (0, 1)
         self.buttons: list[tuple[int, int, int, int, str]] = []
         self._tap: tuple[int, int] | None = None
         self._lock = threading.Lock()
@@ -318,11 +321,6 @@ class Panel:
         return ""
 
     def _map(self, raw_x: int, raw_y: int) -> tuple[int, int]:
-        if self.rotation == 180:
-            x_lo, x_hi, y_lo, y_hi = 3932, 300, 294, 3801
-        else:
-            x_lo, x_hi, y_lo, y_hi = 3932, 300, 294, 3801
-
         def axis(raw: int, lo: int, hi: int, size: int) -> int:
             span = hi - lo
             if span == 0:
@@ -330,6 +328,8 @@ class Panel:
             pos = min(1.0, max(0.0, (raw - lo) / span))
             return int(pos * (size - 1))
 
+        x_lo, x_hi = self.touch_x
+        y_lo, y_hi = self.touch_y
         return axis(raw_x, x_lo, x_hi, self.width), axis(raw_y, y_lo, y_hi, self.height)
 
     def _touch_loop(self, path: str) -> None:
@@ -339,6 +339,8 @@ class Panel:
             print(f"táctil no disponible: {exc}", flush=True)
             return
         event = struct.Struct("qqHHi")
+        self.touch_x = _axis_limits(fd, 0)
+        self.touch_y = _axis_limits(fd, 1)
         raw_x = raw_y = 0
         have = False
         pressed = False
