@@ -14,7 +14,7 @@ The voice on this Pi is Spanish, because that is the language it was built and t
 
 The picture is the framebuffer Raspberry Pi OS already assigned (`fb0`). Playback and the microphone are the ALSA devices the operating system already selected. This project does not configure HDMI, the screen, or a sound card.
 
-The desktop tray app, for a computer that is already nearby, is the separate repository [antonio-castellon/grok_assistant](https://github.com/antonio-castellon/grok_assistant). How this Pi listens, and how to reproduce it, is in [PI_ASSISTANCE_GROK.md](PI_ASSISTANCE_GROK.md).
+The desktop tray app, for a computer that is already nearby, is the separate repository [antonio-castellon/grok_assistant](https://github.com/antonio-castellon/grok_assistant). How to use the running assistant, with a picture of its screen, is in [GUIDE.md](GUIDE.md). How this Pi listens, and how to reproduce it, is in [PI_ASSISTANCE_GROK.md](PI_ASSISTANCE_GROK.md).
 
 ## Clean install
 
