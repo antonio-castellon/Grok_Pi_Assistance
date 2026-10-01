@@ -226,30 +226,43 @@ def resolve_playback(cfg: dict) -> str:
     return "default"
 
 
+def _spawn_arecord(device: str) -> subprocess.Popen:
+    return subprocess.Popen(
+        [
+            "arecord",
+            "-D",
+            device,
+            "-f",
+            "S16_LE",
+            "-r",
+            str(RATE),
+            "-c",
+            "1",
+            "-t",
+            "raw",
+            "-q",
+            "--buffer-time",
+            "200000",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
 class Mic:
     def __init__(self, device: str):
         self.device = device
-        self.proc = subprocess.Popen(
-            [
-                "arecord",
-                "-D",
-                device,
-                "-f",
-                "S16_LE",
-                "-r",
-                str(RATE),
-                "-c",
-                "1",
-                "-t",
-                "raw",
-                "-q",
-                "--buffer-time",
-                "200000",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        self.proc = _spawn_arecord(device)
         self.buf = b""
+
+    def ensure_open(self) -> bool:
+        """Open this capture device once if it is not already running, and leave it open."""
+        if self.proc.poll() is None:
+            return True
+        self.close()
+        self.buf = b""
+        self.proc = _spawn_arecord(self.device)
+        return self.proc.poll() is None
 
     def read_frames(self, frames: int = CHUNK_FRAMES, timeout: float = 2.0) -> np.ndarray | None:
         need = frames * 2
@@ -629,6 +642,13 @@ class HeardDisplay:
 
     def update(self, text: str, level: float) -> None:
         shown = text.strip() or "(silencio)"
+        if (
+            self.in_test
+            and self.asr_name
+            and shown not in {"(silencio)", "(en pausa)", "escuchando…"}
+            and not shown.endswith("\n" + self.asr_name)
+        ):
+            shown = shown + "\n" + self.asr_name
         now = time.monotonic()
         changed = shown != self.last_text
         if changed:
@@ -1013,6 +1033,13 @@ class HeardDisplay:
         return y
 
     def _wrap(self, text: str, cols: int) -> list[str]:
+        pieces = text.split("\n")
+        lines: list[str] = []
+        for piece in pieces:
+            lines.extend(self._wrap_piece(piece, cols))
+        return lines or [""]
+
+    def _wrap_piece(self, text: str, cols: int) -> list[str]:
         words = text.split()
         if not words:
             return [""]
@@ -1673,6 +1700,10 @@ class Speech:
         self.asr = None
         self.tts = None
         self.spanish = None
+        self.reread = None
+        self.reread_label = ""
+        self._reread_live = False
+        self._reread_id = ""
         self._sherpa = sherpa_onnx
         self.speed = float(cfg["tts_speed"])
         if self.language == "es":
@@ -1736,6 +1767,7 @@ class Speech:
             log.exception("no pude puntuar los motores")
         self._select_asr(choose_live_asr(saved))
         log_listen_motor(self)
+        self.log_reread_line()
 
     def _load_spanish_voice(self, threads: int) -> None:
         self.voice_specs = [
@@ -1871,6 +1903,7 @@ class Speech:
         self.asr_label = chosen["label"]
         self._save_asr_id(chosen["id"])
         log.info("reconocedor activo: %s", self.asr_label)
+        self._ensure_reread()
         return self.asr_label
 
     def _load_chosen(self, chosen: dict) -> None:
@@ -2046,6 +2079,94 @@ class Speech:
         off.accept_waveform(RATE, pcm)
         self.offline.decode_stream(off)
         return (off.result.text or "").strip()
+
+    def _reread_choice(self) -> dict | None:
+        """Whisper base, or Whisper pequeño when base is not installed."""
+        ready = {item["id"]: item for item in available_asrs()}
+        return ready.get("base") or ready.get("whisper")
+
+    def _release_reread(self) -> None:
+        if self.reread is None and not self._reread_live:
+            return
+        self.reread = None
+        self._reread_live = False
+        self._reread_id = ""
+        import gc
+
+        gc.collect()
+
+    def _ensure_reread(self) -> None:
+        """Keep one Whisper model for the second reading, apart from the live engine when it differs."""
+        chosen = self._reread_choice()
+        if chosen is None:
+            self._release_reread()
+            self.reread_label = ""
+            return
+        self.reread_label = str(chosen["label"])
+        if self.asr_id == chosen["id"] and self.offline is not None:
+            if self.reread is not None:
+                self.reread = None
+                import gc
+
+                gc.collect()
+            self._reread_live = True
+            self._reread_id = chosen["id"]
+            return
+        if self.reread is not None and self._reread_id == chosen["id"]:
+            self._reread_live = False
+            return
+        self._release_reread()
+        self.reread_label = str(chosen["label"])
+        try:
+            encoder, decoder, tokens = _whisper_files(chosen["dir"], chosen["prefix"])
+            self.reread = self._sherpa.OfflineRecognizer.from_whisper(
+                encoder=str(encoder),
+                decoder=str(decoder),
+                tokens=str(tokens),
+                language="es",
+                task="transcribe",
+                num_threads=self._threads,
+                provider="cpu",
+            )
+        except Exception:
+            log.exception("no pude cargar la relectura")
+            self.reread = None
+            self.reread_label = ""
+            self._reread_id = ""
+            self._reread_live = False
+            return
+        self._reread_id = chosen["id"]
+        self._reread_live = False
+
+    def log_reread_line(self) -> None:
+        if not self.reread_label:
+            return
+        log.info(
+            "fuera de la prueba, releo cada frase con %s para guardar los nombres en inglés",
+            self.reread_label,
+        )
+
+    def reread_text(self, samples: np.ndarray | None) -> str:
+        engine = self.reread
+        if engine is None and self._reread_live:
+            engine = self.offline
+        if engine is None or samples is None:
+            return ""
+        audio = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return ""
+        if float(np.max(np.abs(audio))) > 2.0:
+            audio = audio / 32768.0
+        if audio.size < int(0.2 * RATE):
+            return ""
+        try:
+            off = engine.create_stream()
+            off.accept_waveform(RATE, audio)
+            engine.decode_stream(off)
+            return (off.result.text or "").strip()
+        except Exception:
+            log.exception("relectura")
+            return ""
 
     def synthesize(self, text: str) -> tuple[np.ndarray, int]:
         sid = getattr(self, "voice_sid", 0)
@@ -2272,6 +2393,7 @@ def score_missing_engines(speech: Speech) -> None:
     One model at a time, so a small Pi is not asked to hold every engine.
     """
     book = speakers()
+    speech._release_reread()
     if not any(person.get("raw") for person in book.people):
         return
     installed = {item["id"]: item for item in available_asrs()}
@@ -2660,6 +2782,9 @@ def describe_sessions() -> str:
 
 
 AGENTS_DIR = Path.home() / ".grok" / "agents"
+BUNDLED_AGENTS = Path.home() / ".grok" / "bundled" / "agents"
+ACCOUNT_AGENTS = Path.home() / ".config" / "grok-assistant" / "account-agents"
+AGENT_STATE = Path.home() / ".config" / "grok-assistant" / "agent-state.json"
 ACTIVE_AGENT = Path.home() / ".config" / "grok-assistant" / "active-agent"
 
 
@@ -2676,12 +2801,6 @@ def set_active_agent(name: str) -> None:
         ACTIVE_AGENT.write_text(name + "\n", encoding="utf-8")
     elif ACTIVE_AGENT.exists():
         ACTIVE_AGENT.unlink()
-
-
-def list_agent_names() -> list[str]:
-    if not AGENTS_DIR.is_dir():
-        return []
-    return sorted(path.stem for path in AGENTS_DIR.glob("*.md"))
 
 
 def write_agent(name: str) -> None:
@@ -3255,139 +3374,8 @@ def help_speech() -> str:
         "Comando modo administrador, y después la clave, solo para tareas del sistema. "
         "Comando otro reconocedor cambia entre Kroko, Whisper, base, small y Canary. "
         "Comando personalidad elige una de las ocho. "
-        "Comando identifica mi voz graba dieciséis frases, una sola vez."
+        "Comando identifica mi voz graba dieciséis frases, una sola vez, después del pitido."
     )
-
-
-class MusicPlayer:
-    """Audio-only playback from a YouTube search. One song at a time."""
-
-    def __init__(self) -> None:
-        self.proc: subprocess.Popen | None = None
-        self.sock = Path("/tmp/grok-music.sock")
-        self.title = ""
-        self.user_paused = False
-        self._for_voice = False
-
-    def playing(self) -> bool:
-        alive = self.proc is not None and self.proc.poll() is None
-        if not alive and (self.user_paused or self._for_voice):
-            self.user_paused = False
-            self._for_voice = False
-        return alive
-
-    def _ipc(self, command: list) -> bool:
-        if not self.sock.exists():
-            return False
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(0.4)
-                sock.connect(str(self.sock))
-                sock.sendall(json.dumps({"command": command}).encode() + b"\n")
-        except OSError:
-            return False
-        return True
-
-    def pause_for_voice(self) -> bool:
-        # A song the user already paused must not start again after we speak.
-        if not self.playing() or self.user_paused:
-            return False
-        self._for_voice = True
-        return self._ipc(["set_property", "pause", True])
-
-    def resume(self) -> None:
-        if self._for_voice and self.playing() and not self.user_paused:
-            self._ipc(["set_property", "pause", False])
-        self._for_voice = False
-
-    def user_pause(self) -> None:
-        self.user_paused = True
-        self._ipc(["set_property", "pause", True])
-        log.info("música en pausa")
-
-    def user_resume(self) -> None:
-        self.user_paused = False
-        if self.playing():
-            self._ipc(["set_property", "pause", False])
-        log.info("música sigue")
-
-    def stop(self) -> None:
-        proc = self.proc
-        self.proc = None
-        self.title = ""
-        self.user_paused = False
-        self._for_voice = False
-        if proc is None or proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except OSError:
-            proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                proc.kill()
-
-    def play(self, query: str, device: str) -> str:
-        ytdlp = ROOT / ".venv" / "bin" / "yt-dlp"
-        if not ytdlp.is_file():
-            found = shutil.which("yt-dlp")
-            ytdlp = Path(found) if found else ytdlp
-        if not ytdlp.is_file() or not shutil.which("mpv"):
-            return ""
-        self.stop()
-        try:
-            found = subprocess.run(
-                [
-                    str(ytdlp),
-                    "--no-playlist",
-                    "--no-warnings",
-                    "-f",
-                    "bestaudio/best",
-                    "--print",
-                    "%(title)s",
-                    "--print",
-                    "url",
-                    f"ytsearch1:{query}",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=40,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            log.warning("búsqueda de música: %s", exc)
-            return ""
-        lines = [line.strip() for line in (found.stdout or "").splitlines() if line.strip()]
-        if found.returncode != 0 or len(lines) < 2:
-            log.warning("búsqueda de música: %s", (found.stderr or "").strip()[:300])
-            return ""
-        title, url = lines[0], lines[1]
-        self.sock.unlink(missing_ok=True)
-        audio_device = device if device.startswith("alsa/") else f"alsa/{device}"
-        self.proc = subprocess.Popen(
-            [
-                "mpv",
-                "--no-video",
-                "--really-quiet",
-                "--no-terminal",
-                f"--audio-device={audio_device}",
-                f"--input-ipc-server={self.sock}",
-                "--ytdl=no",
-                url,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        self.title = title
-        log.info("música: %s", title)
-        return title
-
-
-music = MusicPlayer()
 
 
 def music_command(text: str) -> tuple[str, str] | None:
@@ -3480,58 +3468,6 @@ def is_voice_enroll(text: str) -> bool:
     return bool(words) and len(words) <= 6 and "identifica" in words and "voz" in words
 
 
-def _drain_mic(mic: Mic, seconds: float = 0.5) -> None:
-    """Drop the tail of the spoken prompt so it is not stored as the user's voice."""
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        if mic.read_frames(timeout=0.2) is None:
-            return
-
-
-def _enroll_take(
-    speech: Speech,
-    mic: Mic,
-    floor: NoiseFloor,
-    cfg: dict,
-    display: HeardDisplay,
-    prompt: str,
-) -> tuple[str, np.ndarray | None]:
-    """One prompted phrase. The bottom line shows DI and OI. Returns text and audio."""
-    stream = speech.new_stream()
-    chunks: list[np.ndarray] = []
-    quiet = 0.0
-    text = ""
-    step = CHUNK_FRAMES / RATE
-    silence_s = float(cfg["silence_seconds"])
-    deadline = time.monotonic() + 30
-    display.update(f"DI: {prompt}   OI:", display.level)
-    while not STOP and time.monotonic() < deadline:
-        if not display.listening:
-            return "", None
-        block = mic.read_frames()
-        if block is None:
-            return text, np.concatenate(chunks) if chunks else None
-        level = rms(block)
-        floor.observe(level)
-        loud = level >= floor.threshold(float(cfg["speech_rms_min"]))
-        if loud or (chunks and quiet < silence_s):
-            chunks.append(np.array(block, copy=True))
-            heard = (speech.feed_spanish(stream, block) or "").strip()
-            if heard:
-                text = heard
-            display.update(f"DI: {prompt}   OI: {text}", level)
-            quiet = 0.0 if loud else quiet + step
-            if text and quiet >= silence_s:
-                final = (speech.finish_spanish(stream) or text).strip()
-                display.update(f"DI: {prompt}   OI: {final}", level)
-                return final, np.concatenate(chunks)
-        else:
-            display.update(f"DI: {prompt}   OI: {text}", level)
-    final = (speech.finish_spanish(stream) or text).strip()
-    display.update(f"DI: {prompt}   OI: {final}", display.level)
-    return final, np.concatenate(chunks) if chunks else None
-
-
 def _enroll_stopped(text: str) -> bool:
     return is_leave_test(text) or _folded_words(text) in {"salir", "cancela", "cancelar"}
 
@@ -3588,8 +3524,7 @@ def _enroll_choose_name(
         if not candidate:
             speak(speech, "¿Cómo te llamas?" if ask_name else "Di otro nombre.", speaker)
             ask_name = False
-            _drain_mic(mic)
-            heard, audio = _enroll_take(speech, mic, floor, cfg, display, "cómo te llamas")
+            heard, audio = _enroll_listen(speech, mic, display, speaker, "cómo te llamas")
             if _enroll_stopped(heard):
                 return ""
             candidate = person_name(heard)
@@ -3613,8 +3548,7 @@ def _enroll_choose_name(
         else:
             nombre = ""
             speak(speech, f"No tengo a {candidate}. ¿Lo guardo como otra persona?", speaker)
-        _drain_mic(mic)
-        answer, answer_audio = _enroll_take(speech, mic, floor, cfg, display, "sí o no")
+        answer, answer_audio = _enroll_listen(speech, mic, display, speaker, "sí o no")
         if _enroll_stopped(answer):
             return ""
         if confirms(answer) is True:
@@ -3653,34 +3587,43 @@ def run_voice_enrollment(
         speak(speech, "Cancelo la identificación.", speaker)
         return
     taken: list[tuple[str, np.ndarray, np.ndarray]] = []
-    empty_run = 0
+    failures = 0
     total = len(ENROLL_LINES)
-    for index, prompt in enumerate(ENROLL_LINES, start=1):
-        if index == 1:
-            spoken = (
-                f"Grabaré {total} frases una sola vez. El sonido vale para todos los motores. "
-                f"1 de {total}. {prompt}"
-            )
-        else:
-            spoken = f"{index} de {total}. {prompt}"
-        speak(speech, spoken, speaker)
-        _drain_mic(mic)
-        heard, audio = _enroll_take(speech, mic, floor, cfg, display, prompt)
+    speak(
+        speech,
+        (
+            f"Grabaré {total} frases una sola vez. Guardo el sonido en crudo, sin comprobar las palabras. "
+            "El sonido vale para todos los motores. Habla después del pitido, y espera el segundo pitido."
+        ),
+        speaker,
+    )
+    index = 0
+    while index < total:
+        prompt = ENROLL_LINES[index]
+        speak(speech, f"{index + 1} de {total}. {prompt}", speaker)
+        heard, audio = _enroll_listen(speech, mic, display, speaker, prompt)
         if _enroll_stopped(heard):
             speak(speech, "Cancelo la identificación.", speaker)
             return
-        captured = book.capture(audio)
-        if captured is None:
-            empty_run += 1
-            log.info("toma vacía %d", index)
-            if empty_run >= 3:
-                speak(speech, "No oigo el micrófono. Lo dejo.", speaker)
-                return
+        has_samples = audio is not None and int(getattr(audio, "size", 0)) > 0
+        captured = book.capture(audio) if has_samples else None
+        log_enroll_take(heard, has_samples, speech.asr_label)
+        outcome = enroll_result(has_samples, captured is not None, heard)
+        if outcome == "keep" and captured is not None:
+            failures = 0
+            vector, wave_audio = captured
+            taken.append((prompt, wave_audio, vector))
+            index += 1
             continue
-        empty_run = 0
-        vector, wave_audio = captured
-        taken.append((prompt, wave_audio, vector))
-        log.info("toma de voz %d OI: %s", len(taken), heard)
+        failures += 1
+        if failures >= 3:
+            if outcome == "retry":
+                speak(speech, f"He oído: {heard.strip()}. No he cogido la huella. Lo dejo.", speaker)
+            else:
+                speak(speech, "No oigo el micrófono. Lo dejo.", speaker)
+            return
+        if outcome == "retry":
+            speak(speech, f"He oído: {heard.strip()}. No he cogido la huella. Repite.", speaker)
     group = largest_voice_group([item[2] for item in taken])
     if len(group) < 12:
         speak(speech, "Estas tomas no son una sola voz. No guardo a otra persona.", speaker)
@@ -3702,6 +3645,8 @@ def run_voice_enrollment(
         log.exception("no pude puntuar tras identificar")
         if speech.spanish is None and speech.offline is None:
             speech._select_asr("kroko")
+        else:
+            speech._ensure_reread()
 
 
 def is_shutdown(text: str) -> bool:
@@ -4226,220 +4171,6 @@ def voice_addresses_grok(text: str) -> bool:
     return False
 
 
-class _VoiceLane:
-    def __init__(self, speech: Speech, embedding: np.ndarray | None, label: str, saved_index: int) -> None:
-        self.embedding = embedding
-        self.label = label
-        self.saved_index = saved_index
-        self.stream = speech.new_stream()
-        self.audio: list[np.ndarray] = []
-        self.text = ""
-        self.quiet = 0.0
-        self.alive = False
-        self.last_heard = 0.0
-
-
-class VoiceRoom:
-    """One transcript per voice print. Side talk never joins another person's words."""
-
-    def __init__(self, speech: Speech, cfg: dict) -> None:
-        self.speech = speech
-        self.silence_s = float(cfg["silence_seconds"])
-        self.max_samples = int(float(cfg["max_utterance_seconds"]) * RATE)
-        self.lanes: list[_VoiceLane] = []
-        self.probe: list[np.ndarray] = []
-        self.probe_n = 0
-        self.active: _VoiceLane | None = None
-        self.serial = 1
-
-    def reset(self) -> None:
-        self.lanes.clear()
-        self.probe.clear()
-        self.probe_n = 0
-        self.active = None
-
-    def feed(self, block: np.ndarray, loud: bool) -> list[tuple]:
-        events: list[tuple] = []
-        frame = np.array(block, copy=True)
-        step = frame.size / RATE
-        now = time.monotonic()
-        for lane in list(self.lanes):
-            if lane is self.active or not lane.last_heard:
-                continue
-            if now - lane.last_heard >= 10:
-                log.info("descarto voz temporal: %s", lane.label)
-                self.lanes.remove(lane)
-                if lane is self.active:
-                    self.active = None
-        # The recognizer needs the whole phrase, quiet parts included.
-        # Feeding only the loud peaks left "comando apaga…" as empty text.
-        if self.active is None and loud:
-            self.active = self._make(None, self._anon_label(), -1)
-        if self.active is not None and (loud or self.active.quiet < self.silence_s):
-            self._hear(self.active, frame)
-            if loud:
-                self.active.quiet = 0.0
-                self.probe.append(frame)
-                self.probe_n += int(frame.size)
-                if self.probe_n >= int(0.8 * RATE):
-                    self._identify()
-            else:
-                self.active.quiet += step
-            for lane in self.lanes:
-                if lane is not self.active:
-                    lane.quiet += step
-        else:
-            for lane in self.lanes:
-                lane.quiet += step
-            self.probe.clear()
-            self.probe_n = 0
-        for lane in list(self.lanes):
-            samples = sum(int(chunk.size) for chunk in lane.audio)
-            if not lane.alive:
-                continue
-            if lane.quiet < self.silence_s and samples < self.max_samples:
-                continue
-            text = (self.speech.finish_spanish(lane.stream) or lane.text or "").strip()
-            audio = np.concatenate(lane.audio) if lane.audio else None
-            label, embedding, saved = lane.label, lane.embedding, lane.saved_index
-            lane.alive = False
-            lane.text = ""
-            lane.audio = []
-            lane.stream = self.speech.new_stream()
-            lane.quiet = 0.0
-            if lane is self.active:
-                self.active = None
-            if text:
-                events.append(("final", label, text, audio, embedding, saved))
-        parts = [f"{lane.label}: {lane.text}" for lane in self.lanes if lane.text]
-        events.append(("partial", " | ".join(parts)))
-        return events
-
-    def _identify(self) -> None:
-        if not self.probe or self.active is None:
-            self.probe.clear()
-            self.probe_n = 0
-            return
-        audio = np.concatenate(self.probe)
-        self.probe.clear()
-        self.probe_n = 0
-        book = speakers()
-        emb = book.embed(audio)
-        if emb is None:
-            return
-        if book.self_embedding is not None and book.self_embedding.shape == emb.shape:
-            if book._similar(emb, book.self_embedding) >= 0.55:
-                log.info("mi voz, no la mezclo")
-                self._drop(self.active)
-                self.active = None
-                return
-        name, index, known = "", -1, 0.0
-        best_person = None
-        for person_index, person in enumerate(book.people):
-            score = book.best_score(emb, person)
-            if score > known:
-                known, name, index, best_person = score, str(person["name"]), person_index, person
-        other_lane = None
-        other_score = 0.0
-        for lane in self.lanes:
-            if lane is self.active or lane.embedding is None or lane.embedding.shape != emb.shape:
-                continue
-            score = book._similar(emb, lane.embedding)
-            if score > other_score:
-                other_lane, other_score = lane, score
-        changed = other_lane is not None and other_score >= 0.48 and other_score >= known
-        if changed and other_lane is not None:
-            log.info("cambia la voz: %s -> %s %.2f", self.active.label, other_lane.label, other_score)
-            self.active.quiet = self.silence_s
-            self.active = other_lane
-            other_lane.embedding = 0.75 * other_lane.embedding + 0.25 * emb
-            return
-        if best_person is not None and known >= book.gate(best_person) and name:
-            if self.active.label != name:
-                log.info("voz conocida: %s %.2f", name, known)
-            self.active.label = name
-            self.active.saved_index = index
-        if self.active.embedding is None:
-            self.active.embedding = emb
-        elif self.active.embedding.shape == emb.shape:
-            self.active.embedding = 0.75 * self.active.embedding + 0.25 * emb
-
-    def _drop(self, lane: _VoiceLane) -> None:
-        lane.alive = False
-        lane.text = ""
-        lane.audio = []
-        lane.stream = self.speech.new_stream()
-        lane.quiet = 0.0
-
-    def _assign(self, audio: np.ndarray) -> _VoiceLane | None:
-        book = speakers()
-        emb = book.embed(audio)
-        if emb is None:
-            return self.active
-        if book.self_embedding is not None and book.self_embedding.shape == emb.shape:
-            if book._similar(emb, book.self_embedding) >= 0.50:
-                log.info("mi voz, no la mezclo")
-                return None
-        best_i, best_s, best_name = -1, 0.0, ""
-        best_person = None
-        for index, person in enumerate(book.people):
-            score = book.best_score(emb, person)
-            if score > best_s:
-                best_s, best_i, best_name = score, index, str(person["name"])
-                best_person = person
-        if best_person is not None and best_s >= book.gate(best_person) and best_name:
-            for lane in self.lanes:
-                if lane.saved_index == best_i:
-                    if lane.embedding is None or getattr(lane.embedding, "shape", None) != emb.shape:
-                        lane.embedding = emb
-                    else:
-                        lane.embedding = 0.7 * lane.embedding + 0.3 * emb
-                    return lane
-            log.info("voz conocida: %s %.2f", best_name, best_s)
-            return self._make(emb, best_name, best_i)
-        best: _VoiceLane | None = None
-        score = 0.0
-        for lane in self.lanes:
-            if lane.embedding is None or lane.embedding.shape != emb.shape:
-                continue
-            here = book._similar(emb, lane.embedding)
-            if here > score:
-                best, score = lane, here
-        if best is not None and score >= 0.48:
-            best.embedding = 0.75 * best.embedding + 0.25 * emb
-            return best
-        label = self._anon_label()
-        log.info("voz nueva: %s", label)
-        return self._make(emb, label, -1)
-
-    def _anon_label(self) -> str:
-        used = {lane.label for lane in self.lanes}
-        number = 1
-        while f"voz {number}" in used:
-            number += 1
-        return f"voz {number}"
-
-    def _make(self, embedding: np.ndarray, label: str, saved_index: int) -> _VoiceLane:
-        if len(self.lanes) >= 4:
-            quiet = [lane for lane in self.lanes if lane is not self.active and not lane.alive]
-            if quiet:
-                self.lanes.remove(max(quiet, key=lambda lane: lane.quiet))
-        lane = _VoiceLane(self.speech, embedding, label, saved_index)
-        self.lanes.append(lane)
-        return lane
-
-    def _hear(self, lane: _VoiceLane, frame: np.ndarray) -> None:
-        lane.alive = True
-        lane.last_heard = time.monotonic()
-        lane.audio.append(frame)
-        total = sum(int(chunk.size) for chunk in lane.audio)
-        if total > self.max_samples:
-            lane.audio = lane.audio[-8:]
-        text = (self.speech.feed_spanish(lane.stream, frame) or "").strip()
-        if text:
-            lane.text = text
-
-
 def opening_greeting(book: SpeakerBook, index: int, name: str) -> str:
     """How to open, from how long this voice has been away."""
     elapsed = book.since(index)
@@ -4678,8 +4409,9 @@ def ask_grok(
     if model:
         cmd.extend(["-m", model])
     agent = active_agent()
-    if agent:
-        cmd.extend(["--agent", agent])
+    markdown = agent_markdown(agent) if agent else None
+    if markdown is not None:
+        cmd.extend(["--agent", str(markdown)])
     entry = bind_session(cmd)
     out, err, code = run_grok_watched(cmd, grok_env(), int(cfg["grok_timeout_seconds"]), "Grok")
     if code != 0:
@@ -5058,7 +4790,7 @@ def apply_waiting_command(
             name = str(state.get("agent") or "")
             state["agent"] = ""
             write_agent(name)
-            speak(speech, f"Agente {session_label(name)} creado.", speaker)
+            speak(speech, f"Agente {name} creado.", speaker)
             return "used"
         speak(speech, "No he oído la clave. Repítela.", speaker)
         return "used"
@@ -5205,12 +4937,7 @@ def apply_waiting_command(
     if agent:
         kind, name = agent
         if kind == "list":
-            names = list_agent_names()
-            if not names:
-                speak(speech, "No hay agentes.", speaker)
-            else:
-                spoken = ", ".join(session_label(item) for item in names)
-                speak(speech, f"Hay {len(names)} agentes: {spoken}.", speaker)
+            speak(speech, agent_list_line(), speaker)
         elif kind == "close":
             if not active_agent():
                 speak(speech, "No hay ningún agente abierto.", speaker)
@@ -5220,19 +4947,22 @@ def apply_waiting_command(
         elif kind == "create":
             if not name:
                 speak(speech, "No he oído el nombre del agente.", speaker)
-            elif name in list_agent_names():
-                speak(speech, f"El agente {session_label(name)} ya existe.", speaker)
+            elif resolve_agent(name):
+                speak(speech, f"El agente {name} ya existe.", speaker)
             else:
                 state["agent"] = name
-                speak(speech, f"Para crear el agente {session_label(name)} di la clave.", speaker)
+                speak(speech, f"Para crear el agente {name} di la clave.", speaker)
         else:
+            found = resolve_agent(name) if name else None
             if not name:
                 speak(speech, "No he oído el nombre del agente.", speaker)
-            elif name not in list_agent_names():
+            elif found is None:
                 speak(speech, "No tengo ese agente.", speaker)
             else:
-                set_active_agent(name)
-                speak(speech, f"Agente {session_label(name)}.", speaker)
+                stem, _path = found
+                remember_agent_id(stem)
+                set_active_agent(stem)
+                speak(speech, f"Agente {stem}.", speaker)
                 return "agent"
         return "used"
     command = session_command(text)
@@ -5303,7 +5033,8 @@ def listen_spanish(
 ) -> None:
     stream = speech.new_stream()
     quiet = 0.0
-    pending = ""
+    utterance: list[np.ndarray] = []
+    pending = ""; utterance.clear()
     paused_clear = False
     waiting = {"key": False, "create": "", "delete": "", "off": False}
     room = VoiceRoom(speech, cfg) if speakers().extractor is not None else None
@@ -5340,19 +5071,22 @@ def listen_spanish(
                 room.reset()
                 break
         for lane in list(room.lanes):
-            if not lane.text or not opens_talk(lane.text):
+            if not lane.text:
                 continue
             audio = np.concatenate(lane.audio) if lane.audio else None
-            heard = command_body(lane.text) or lane.text
+            heard_text = lane.text if display.in_test else second_reading(speech, lane.text, audio)
+            if not opens_talk(heard_text):
+                continue
+            heard = command_body(heard_text) or heard_text
             if is_voice_enroll(heard):
                 if not enroll_open(lane.embedding, audio):
                     continue
             elif not allowed_voice(lane.embedding, audio, lane.label):
                 continue
-            log.info("hola, sin búsqueda: %s", lane.text)
+            log.info("hola, sin búsqueda: %s", heard_text)
             if not display.listening:
                 return
-            speak(speech, wake_reply(lane.text), speaker)
+            speak(speech, wake_reply(heard_text), speaker)
             run_conversation(
                 speech, mic, stream, floor, speaker, cfg, display, "",
                 admin=False, samples=audio, skip_hello=True, owner=lane.embedding,
@@ -5361,6 +5095,8 @@ def listen_spanish(
             room = VoiceRoom(speech, cfg)
             return
         for _kind, label, text, audio, embedding, _saved in finals:
+            if not display.in_test:
+                text = second_reading(speech, text, audio)
             order_text = command_body(text)
             if order_text is None:
                 order_text = text
@@ -5506,7 +5242,7 @@ def listen_spanish(
                 speech.reset_stream(stream)
                 if room is not None:
                     room.reset()
-                pending = ""
+                pending = ""; utterance.clear()
                 quiet = 0.0
                 paused_clear = True
             held = display.shown if display.shown not in {"", "(silencio)"} else "(en pausa)"
@@ -5517,6 +5253,10 @@ def listen_spanish(
         if room is not None:
             _from_voices(block, loud, level)
             continue
+        if loud and quiet >= silence_s:
+            utterance.clear()
+        if loud or (utterance and quiet < silence_s):
+            utterance.append(np.array(block, copy=True))
         if speech.keep_audio(stream, loud, quiet):
             text = (speech.feed_spanish(stream, block) or "").strip()
         else:
@@ -5552,19 +5292,19 @@ def listen_spanish(
                 speech.reset_stream(stream)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 sticky = ""
             elif shown and not loud and quiet >= silence_s:
                 speech.reset_stream(stream)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
             continue
         if shown and command_body(shown) is None and is_own_words(shown):
             log.info("eco, lo suelto: %s", shown)
             speech.reset_stream(stream)
             quiet = 0.0
-            pending = ""
+            pending = ""; utterance.clear()
             continue
         if opens_talk(shown):
             # The wake only opens the talk. Do not search, and do not send
@@ -5574,7 +5314,7 @@ def listen_spanish(
             if not display.listening:
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 continue
             speak(speech, wake_reply(shown), speaker)
             run_conversation(
@@ -5582,19 +5322,23 @@ def listen_spanish(
             )
             stream = speech.new_stream()
             quiet = 0.0
-            pending = ""
+            pending = ""; utterance.clear()
             continue
         # Exact commands run here, once the phrase has ended. Cutting at six
         # words while the person is still talking wiped "pon la canción" plus
         # the title before the recognizer could finish it. A finished phrase
         # longer than six words is dropped below, unless it is a song request.
         if shown and not loud and quiet >= silence_s:
-            heard_samples = np.concatenate(list(voice_audio)) if voice_audio else None
+            heard_samples = np.concatenate(utterance) if utterance else None
+            if not display.in_test:
+                shown = second_reading(speech, shown, heard_samples)
+                pending = shown
+                text = shown
             if command_body(shown) is None and speakers().is_self(heard_samples):
                 log.info("eco de mi voz, lo suelto: %s", shown)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 continue
             if waiting.get("confirm"):
                 orden = str(waiting.pop("confirm"))
@@ -5621,7 +5365,7 @@ def listen_spanish(
                     speak(speech, "Vale.", speaker)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 continue
             # A command starts with "comando". Anything else stays out of
             # the cloud, unless a yes/no or a key is already expected.
@@ -5640,21 +5384,21 @@ def listen_spanish(
                 speech.reset_stream(stream)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 continue
             if not pending_answer and body is None:
                 log.info("sin comando, lo dejo: %s", shown)
                 speech.reset_stream(stream)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 continue
             if body is not None and not body:
                 speak(speech, "No he oído el comando.", speaker)
                 speech.reset_stream(stream)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 continue
             order = body if body is not None else shown
             if body is not None and len(_folded_words(order).split()) > 16:
@@ -5663,7 +5407,7 @@ def listen_spanish(
                 speech.reset_stream(stream)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 continue
             if is_goodbye(order) or is_nothing_needed(order):
                 log.info("cierre oído fuera de conversación: %s", order)
@@ -5671,7 +5415,7 @@ def listen_spanish(
                 speech.reset_stream(stream)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 continue
             action = apply_waiting_command(speech, speaker, cfg, display, order, waiting)
             if action == "enroll":
@@ -5679,7 +5423,7 @@ def listen_spanish(
                 speech.reset_stream(stream)
                 stream = speech.new_stream()
                 quiet = 0.0
-                pending = ""
+                pending = ""; utterance.clear()
                 continue
             if not action and body is not None:
                 # The word comando was there, but the rest is not an exact order.
@@ -5709,12 +5453,12 @@ def listen_spanish(
             # The recognizer may have been replaced. Start a stream of the new kind.
             stream = speech.new_stream()
             quiet = 0.0
-            pending = ""
+            pending = ""; utterance.clear()
             continue
         if not shown and quiet >= silence_s and speech.asr_kind == "streaming":
             speech.reset_stream(stream)
             quiet = 0.0
-            pending = ""
+            pending = ""; utterance.clear()
 
 
 def run_conversation(
@@ -6086,6 +5830,8 @@ def _wait_owner(
                 and owner.shape == embedding.shape
             ):
                 owner[:] = (0.85 * owner + 0.15 * embedding).astype(np.float32)
+            if not display.in_test:
+                text = second_reading(speech, text, audio)
             line = f"{label}: {text}"
             sticky = line
             display.update(line, level)
@@ -6170,6 +5916,8 @@ def wait_for_phrase(
                     heard_audio.clear()
                     utterance_started = None
                     continue
+                if not display.in_test:
+                    heard = second_reading(speech, heard, samples)
                 return heard
         if utterance_started is not None and time.monotonic() - utterance_started >= float(cfg["max_utterance_seconds"]) and not loud:
             log.info("corte por tiempo máximo, %d palabras: %s", len(heard.split()), heard)
@@ -6241,6 +5989,8 @@ def run_loop(speech: Speech, cfg: dict) -> int:
     display.bind(speech)
     display.set_asr_name(speech.asr_label)
     cleanup_orphan_sessions()
+    if speech.language == "es":
+        start_account_agent_fetch()
     announced_missing = False
     announced_ready = False
     try:
@@ -6379,6 +6129,43 @@ def main(argv: list[str]) -> int:
         return self_test(speech, cfg, with_grok=not args.no_grok)
     return run_loop(speech, cfg)
 
+
+
+import pi_extra
+
+_skip_agent_stem = pi_extra._skip_agent_stem
+agent_filename = pi_extra.agent_filename
+agent_sources = pi_extra.agent_sources
+resolve_agent = pi_extra.resolve_agent
+agent_markdown = pi_extra.agent_markdown
+list_agent_names = pi_extra.list_agent_names
+agent_list_line = pi_extra.agent_list_line
+remember_agent_id = pi_extra.remember_agent_id
+_auth_session = pi_extra._auth_session
+_get_json = pi_extra._get_json
+_bundle_agents = pi_extra._bundle_agents
+_customization_markdown = pi_extra._customization_markdown
+_custom_agents = pi_extra._custom_agents
+_replace_account_agents = pi_extra._replace_account_agents
+refresh_account_agents = pi_extra.refresh_account_agents
+start_account_agent_fetch = pi_extra.start_account_agent_fetch
+MusicPlayer = pi_extra.MusicPlayer
+music = pi_extra.music
+_discard_queued = pi_extra._discard_queued
+_pause_and_clear = pi_extra._pause_and_clear
+_tone_path = pi_extra._tone_path
+_play_tone = pi_extra._play_tone
+_enroll_take = pi_extra._enroll_take
+_enroll_listen = pi_extra._enroll_listen
+enroll_result = pi_extra.enroll_result
+log_enroll_take = pi_extra.log_enroll_take
+is_presence_phrase = pi_extra.is_presence_phrase
+_one_token = pi_extra._one_token
+_real_phrase = pi_extra._real_phrase
+second_reading = pi_extra.second_reading
+_phrase_order = pi_extra._phrase_order
+_VoiceLane = pi_extra._VoiceLane
+VoiceRoom = pi_extra.VoiceRoom
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))
