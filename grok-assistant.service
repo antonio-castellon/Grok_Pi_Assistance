@@ -1,0 +1,20 @@
+[Unit]
+Description=Grok voice assistant
+After=sound.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=antonio
+Group=antonio
+SupplementaryGroups=audio video input
+WorkingDirectory=/home/antonio/grok-assistant
+Environment=HOME=/home/antonio
+Environment=XDG_CONFIG_HOME=/home/antonio/.config
+Environment=PATH=/home/antonio/.grok/bin:/home/antonio/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/antonio/grok-assistant/.venv/bin/python /home/antonio/grok-assistant/assistant.py run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

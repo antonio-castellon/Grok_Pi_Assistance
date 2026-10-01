@@ -1,0 +1,19 @@
+[Unit]
+Description=WiFi setup, then the Grok voice assistant
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+User=antonio
+Group=antonio
+SupplementaryGroups=video input netdev
+WorkingDirectory=/home/antonio/grok-assistant
+Environment=HOME=/home/antonio
+Environment=XDG_CONFIG_HOME=/home/antonio/.config
+ExecStart=/usr/bin/python3 /home/antonio/grok-assistant/wifi-boot.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

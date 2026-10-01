@@ -1,0 +1,20 @@
+{
+  "language": "es",
+  "admin_key": "1515",
+  "playback_device": "auto",
+  "capture_device": "auto",
+  "wake_phrases": ["despierta grok"],
+  "wake_boost": 2.8,
+  "wake_threshold": 0.12,
+  "grok_model": "",
+  "reasoning_effort": "low",
+  "silence_seconds": 3.5,
+  "max_utterance_seconds": 45,
+  "no_speech_timeout_seconds": 5,
+  "idle_seconds": 60,
+  "min_speech_seconds": 0.35,
+  "speech_rms_min": 0.004,
+  "grok_timeout_seconds": 120,
+  "tts_speed": 1.0,
+  "num_threads": 3
+}

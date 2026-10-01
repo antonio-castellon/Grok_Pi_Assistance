@@ -1,0 +1,9 @@
+.venv/
+models/
+bin/
+__pycache__/
+*.py[cod]
+hat-status.log
+.reboot-needed
+*.tar.bz2
+*.onnx
