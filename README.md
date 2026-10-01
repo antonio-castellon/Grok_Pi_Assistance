@@ -31,7 +31,7 @@ Run that as the normal user, not as root. The script:
 - installs Python, ALSA utilities, mpv, NetworkManager, the console fonts, and espeak-ng
 - puts the user in the `audio`, `video`, `input`, and `netdev` groups
 - leaves HDMI, the screen, and the sound devices as Raspberry Pi OS configured them
-- creates `.venv` and downloads the speech models (about 1.5 GB)
+- creates `.venv` and downloads the speech models (about 2.1 GB, including Whisper small)
 - installs the Grok CLI if `~/.grok/bin/grok` is missing
 - installs `wifi-boot` and `grok-assistant` for this user
 - enables the Wi-Fi boot service only
@@ -56,7 +56,7 @@ These stay on the device and must not be committed:
 
 - any password, sudo secret, or API token
 - `~/.config/grok-assistant/config.json` when it holds a spoken administrator key
-- `~/.config/grok-assistant/speakers.json` (voice prints)
+- `~/.config/grok-assistant/speakers.json` (voice prints) and `~/.config/grok-assistant/raw/` (enrollment audio)
 - session files under `~/.config/grok-assistant/` and `~/.grok/sessions/`
 
 The `config.json` in this repository has an empty `admin_key`. Administrator mode stays closed until a key is set on the machine.

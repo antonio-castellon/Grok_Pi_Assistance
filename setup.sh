@@ -41,11 +41,13 @@ TTS="https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models"
 KWS="https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models"
 SPK="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models"
 
-# Spanish listener. Kroko is the live recognizer. The other three are in the menu.
+# Spanish listener. Kroko streams. The others close the phrase at silence.
+# Whisper small is scored and can be chosen by voice. It is not the automatic live engine.
 fetch_tar "$ASR/sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06.tar.bz2" \
   sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06
 fetch_tar "$ASR/sherpa-onnx-whisper-tiny.tar.bz2" sherpa-onnx-whisper-tiny
 fetch_tar "$ASR/sherpa-onnx-whisper-base.tar.bz2" sherpa-onnx-whisper-base
+fetch_tar "$ASR/sherpa-onnx-whisper-small.tar.bz2" sherpa-onnx-whisper-small
 fetch_tar "$ASR/sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8.tar.bz2" \
   sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8
 

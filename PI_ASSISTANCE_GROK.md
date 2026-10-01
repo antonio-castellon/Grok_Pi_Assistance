@@ -71,63 +71,98 @@ Put them under `models/` with these directory names.
 
 | Role | Directory | Active now |
 |---|---|---|
-| Speech to text, streaming Spanish | `sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06` | yes, id `kroko` |
-| Speech to text, end of phrase | `sherpa-onnx-whisper-tiny` | selectable, “Whisper pequeño” |
-| Speech to text, end of phrase | `sherpa-onnx-whisper-base` | selectable, “Whisper base” |
-| Speech to text, end of phrase, en/es/de/fr | `sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8` | selectable, “Canary” |
-| Voice prints | `3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx` | yes |
-| Spoken voice 1 | `vits-piper-es_ES-davefx-medium-int8` | yes, “Dave, España” |
-| Voices 2 and 3 | `vits-piper-es_ES-sharvard-medium-int8` | two speaker ids, 0 and 1 |
-| Voice 4 | `vits-piper-es_ES-carlfm-x_low-int8` | |
-| Voice 5 | `vits-piper-es_ES-glados-medium-int8` | |
-| Voice 6 | `vits-piper-es_ES-miro-high-int8` | |
-| Voice 7 | `vits-piper-es_MX-ald-medium-int8` | |
-| Voice 8 | `vits-piper-es_MX-claude-high-int8` | |
-| Voice 9 | `vits-piper-es_AR-daniela-high-int8` | |
+| Speech to text, while the person is speaking | `sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06` | yes, id `kroko`, spoken name Kroko |
+| Speech to text, at silence | `sherpa-onnx-whisper-tiny` | id `whisper`, “Whisper pequeño” |
+| Speech to text, at silence | `sherpa-onnx-whisper-base` | id `base`, “Whisper base” |
+| Speech to text, at silence | `sherpa-onnx-whisper-small` | id `small`, “Whisper small”. Scored, and chosen only by voice. Not the automatic live engine |
+| Speech to text, at silence, en/es/de/fr | `sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8` | id `canary`, “Canary” |
+| Voice prints | `3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx` | yes. One CampPlus print, whatever engine is listening |
+| Spoken voice 1 | `vits-piper-es_ES-davefx-medium-int8` | “Dave, España” |
+| Voices 2 and 3 | `vits-piper-es_ES-sharvard-medium-int8` | “Sharvard, España, hablante 0” and “hablante 1” |
+| Voice 4 | `vits-piper-es_ES-carlfm-x_low-int8` | “Carlfm, España” |
+| Voice 5 | `vits-piper-es_ES-glados-medium-int8` | “Glados, España” |
+| Voice 6 | `vits-piper-es_ES-miro-high-int8` | “Miro, España” |
+| Voice 7 | `vits-piper-es_MX-ald-medium-int8` | “Ald, México” |
+| Voice 8 | `vits-piper-es_MX-claude-high-int8` | “Claude, México” |
+| Voice 9 | `vits-piper-es_AR-daniela-high-int8` | “Daniela, Argentina” |
 
 Archives, from the sherpa-onnx `asr-models` and `tts-models` release assets:
 
 - `sherpa-onnx-streaming-zipformer-es-kroko-2025-08-06.tar.bz2`
 - `sherpa-onnx-whisper-tiny.tar.bz2`
 - `sherpa-onnx-whisper-base.tar.bz2`
+- `sherpa-onnx-whisper-small.tar.bz2` (about 610 MB compressed)
 - `sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8.tar.bz2`
 - `vits-piper-es_ES-davefx-medium-int8.tar.bz2` and the other Piper archives named like their directories
 
 `sherpa-onnx-nemotron-3.5-asr-streaming-0.6b-560ms-int8-2026-06-11` is on this disk and is not in the recognizer menu. On this Pi its real-time factor was about 3 to 5, so it is not the live engine. Do not select it.
 
-Threads for the recognizer are `num_threads` in `config.json`, currently 3. Piper loading uses at most 2.
+Kroko is opened with sherpa’s streaming transducer (encoder, decoder, joiner). No `model_type` is passed. Threads stay `num_threads` from `config.json`, currently 3. Piper loading uses at most 2. Whisper small uses the same filenames as tiny and base, with the prefix `small`. If both a normal `.onnx` and an `int8` file exist, the `int8` file is used.
+
+`comando otro reconocedor` cycles the next installed engine. `comando reconocedor kroko`, `whisper`, `base`, `small`, or `canary` selects that one. Longer names are matched first, so “whisper small” does not select Whisper pequeño. If that folder is missing, the assistant says the engine is not there and keeps the current one.
+
+At startup, if saved recordings have scores, the installed engine with the highest combined percentage becomes the live one. Whisper small is left out of that automatic choice. A tie keeps the engine already in use (`asr-index`). If there are no percentages, the live engine is Kroko. A spoken choice lasts until the next startup or the next full scoring. The percentage is a journal line, not speech and not a number on the screen:
+
+- `motor escucha: Whisper base (91%). huellas combinadas.`
+- `motor escucha: Kroko. huellas combinadas: aún no hay porcentajes.`
+
+An older `asr-index` value `whisper-tiny` is read as `whisper`, and `whisper-base` as `base`.
 
 ## Voice footprint
 
 This is part of the running Pi, not an optional extra.
 
 - Model file: `models/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx`.
-- Store: `/home/antonio/.config/grok-assistant/speakers.json`, mode 600.
-- Each person has up to 12 prints. A phrase matches the closest one.
-- `locked` in that file is the only name the assistant hears after enrollment. Until `identifica mi voz` has been completed once, `locked` is empty.
+- Store: `/home/antonio/.config/grok-assistant/speakers.json`, mode 600. `people` is a dict keyed by name. `locked` is a sibling of `people`, not a field inside one person.
+- Raw audio, not inside the JSON: `/home/antonio/.config/grok-assistant/raw/<slug>/00.wav` and the following files. Each wav is 16 kHz, 16-bit, mono. The slug is the name in lowercase with spaces turned into hyphens. If that folder is already someone else’s, the next one is `nombre-2`. Recording the same person again deletes their previous audio and reuses their slug.
+- One CampPlus print identifies the person no matter which listening engine is active. There is no separate vector per engine.
+- A new person looks like this. `scores` starts empty and fills when each installed engine is scored. `last` is the last time that person spoke, as a Unix time. `greet_count` keeps the rotating extra line in the greeting.
 
-`comando identifica mi voz` is done by ear. The panel also shows `DI:` and `OI:` on the bottom line.
+```json
+{
+  "locked": "Antonio",
+  "people": {
+    "Antonio": {
+      "prints": {"campplus": [[0.01, 0.02]]},
+      "raw": [{"phrase": "hola grok", "file": "antonio/00.wav"}],
+      "scores": {"kroko": {"hits": 14, "total": 16}},
+      "last": 0,
+      "greet_count": 0
+    }
+  }
+}
+```
 
-1. “Di tu nombre.” It waits.
+A print from before this change may still be a list of vectors and may have no `raw`. On load it is kept as `prints.legacy` and is still recognized. It is not rewritten until something else saves the file, and it is not recorded again by itself. It cannot be scored until that person records once with the sixteen phrases.
+
+`comando identifica mi voz` is done by ear. `salir` cancels at any time and saves nothing. The panel also shows `DI:` and `OI:` on the bottom line. The heard words do not have to match the phrase. The audio and the CampPlus vector are what is stored. The microphone is whatever capture device the operating system is already using.
+
+1. “¿Cómo te llamas?” It waits.
 2. Two words in a row, such as Jose Antonio, are one person.
-3. It speaks the name it heard.
-4. Same saved voice or same saved name: “Es la misma persona. ¿Repito su identificación?” A yes replaces that person’s prints. It does not create another person.
-5. New name: “No está guardado. ¿Lo guardo como otra persona?” A no means “Di otro nombre.”
-6. Only a yes keeps the name. That name is written to `locked`.
-7. It speaks four phrases, three times each, and waits for the repeat after every one: `hola grok`, `estás ahí`, `qué hora es`, `pon una canción`. Repeats start with “Otra vez.”
-8. `salir` cancels. Fewer than 3 good takes are not saved.
+3. If that voice or that name is already saved: “Esta voz ya la tengo como NOMBRE. ¿Repito la identificación?” Yes replaces that person and does not create another. No returns to “Di otro nombre.”
+4. If the name is new: “No tengo a NOMBRE. ¿Lo guardo como otra persona?” Yes stores it. No asks for another name.
+5. It then speaks sixteen phrases, once each, and waits for the repeat. The first line is “Grabaré 16 frases una sola vez. El sonido vale para todos los motores. 1 de 16. hola grok”. Later lines are “2 de 16. estás ahí”, and so on.
+6. The phrases, in order: `hola grok`, `estás ahí`, `qué hora es`, `pon una canción`, `sube el volumen`, `baja el volumen`, `para la música`, `buenos días`, `hasta luego`, `qué día es hoy`, `me escuchas`, `gracias`, `abre la sesión`, `cuenta hasta tres`, `cómo estás`, `dime la hora`.
+7. Three empty takes in a row abort with “No oigo el micrófono. Lo dejo.”
+8. Afterward the takes must be one voice. Two takes match when their cosine is at least 0.55. The largest group in which every pair passes is kept. It must contain at least 12 takes. Anything outside that group is dropped. If no group reaches 12, nothing is saved and the person who was already stored stays as they were: “Estas tomas no son una sola voz. No guardo a otra persona.”
+9. When the group is good, only those takes are saved, `locked` is set to that name, and each installed engine is scored from the wavs. “Listo, NOMBRE. El sonido queda guardado y vale para todos los motores. Valoro cada uno.” If some takes were dropped: “Guardo N de 16.”
 
-A screen label such as `voz 78` is not a stored person. It is a temporary lane. This machine has one enrolled name in `speakers.json`: Antonio, with 12 prints, and `locked` is Antonio. An unidentified lane is deleted after 10 seconds without use and is not saved.
+Scoring does not ask the person to speak again. One engine is loaded at a time, each wav is transcribed, and the model is unloaded. A phrase of three words or fewer is a hit only when every word is present, in order. Accents are not required. One inserted, deleted, or substituted character still counts. A phrase of four or more words may miss one word. Extra heard words may be skipped. `hits` and `total` are the kept takes. An engine’s percentage is the sum of hits across every person divided by the sum of totals, rounded to an integer.
 
-After at least one person has finished `identifica mi voz`, only enrolled voices are heard: wake, commands, yes or no, and the open conversation. A print counts when it is within 0.30 of Antonio’s closest saved take, or the lane is already named Antonio. That name check also applies to a live wake line, before the phrase has finished. A lower score is ignored. The process does not quit when that happens. Anyone else is ignored. The exception is `comando identifica mi voz`: any person may say it, otherwise a new voice could never be enrolled. Until the first enrollment, no voice is locked.
+A screen label such as `voz 78` is not a stored person. It is a temporary lane and is deleted after 10 seconds without use.
 
-In administrator mode only: `lista las personas` speaks the names. `borra` plus the name asks sí or no and deletes that person and their prints. If the deleted name is `locked`, the lock is cleared.
+Recognition compares the voice that just spoke with the print, not with the engine that transcribed. CampPlus matches at 0.55: the closest name above that threshold wins. Below it, the speaker is unknown. A legacy print that has no `campplus` vectors is still accepted at 0.30, so the person enrolled before this change is not locked out. A lane name alone does not open the door.
+
+With the CampPlus file loaded: if `locked` is empty, `comando identifica mi voz` is accepted and hearing stays open. Once `locked` is a name, only that voice can wake, give a command, answer yes or no, continue the conversation, or identify again. Someone else saying `hola grok` does nothing. Other saved people stay in the file and are not heard until they are locked. If the CampPlus file is missing, the door stays open and enrollment says the voice model is missing.
+
+In administrator mode only: `lista las personas` speaks the names. `borra` plus the name asks sí or no and deletes that person, their vectors, and their `raw/` folder. If the deleted name is `locked`, the lock is cleared. An empty administrator key means administrator mode does not open.
 
 ## config.json
 
 ```
 language                     es
 admin_key                    empty in the repository
+personality                  empty, or one id: alex, vega, nico, lucia, marcos, ines, bruno, carmen
 playback_device              auto
 capture_device               auto
 silence_seconds              3.5
@@ -143,6 +178,8 @@ reasoning_effort             low
 
 `admin_key` in the repository is empty. A spoken administrator key, when one is used, is written only on the machine in `~/.config/grok-assistant/config.json`. That file is not part of the repository. One wrong digit still matches. With an empty key, administrator mode does not open. Do not put a sudo password or an API token in the repository or in `config.json`.
 
+`personality` empty is the usual assistant. `comando personalidad` says the active name, or “Sin personalidad.” `comando personalidad vega` accepts the id or the name from `personalities.json` and saves it with the machine config. An unknown name gets “No tengo esa personalidad.” and nothing changes. The eight texts are fixed. A ninth personality cannot be created by voice. The chosen person’s block is appended only to the spoken-answer prompt, after the rules Grok already has. The interpreter does not receive it. The trait numbers are ceilings. The reply stays one or two spoken sentences. Correctness wins. The assistant does not say which person or tone is in use.
+
 `auto` means the ALSA default playback device and the ALSA default capture device, the ones the operating system already selected.
 
 ## State files
@@ -156,9 +193,10 @@ All under `/home/antonio/.config/grok-assistant/`:
 | `hello-index` | next boot line in `hellos-es.txt` |
 | `wait-index` | next waiting line in `waits-es.txt` |
 | `volume` | Playback level in percent, 0–100, on the OS default mixer |
-| `speakers.json` | mode 600. People, up to 12 prints each, the assistant’s own print, and `locked`, the only name that may be heard after enrollment |
+| `speakers.json` | mode 600. People as a dict, CampPlus prints or legacy prints, scores, `last`, `greet_count`, and `locked` |
 | `active-agent` | path of the Grok agent in use, if any |
 | `sessions` | local sessions, mode 600 |
+| `raw/<slug>/*.wav` | enrollment audio for scoring. Not inside `speakers.json`. Not in the repository |
 
 Named sessions do not expire. The shared session lasts 24 hours and then a new id is created. Do not delete `~/.grok/sessions/` for the coding session. Cleanup of orphan voice sessions must stay inside the voice working directory.
 
@@ -200,11 +238,13 @@ Every other order starts with the word `comando`. The screen says that once, on 
 
 `comando apaga el dispositivo` asks `¿Apago el dispositivo? Di sí o no.` Only `sí` runs `shutdown -h now` through the sudo wrapper.
 
-In administrator mode, `lista las personas` speaks the identified names, and `borra` plus the name asks sí or no before deleting that person and their prints. If the deleted name is `locked`, the lock is cleared and any voice can speak again until the next enrollment. These two orders do nothing without administrator mode.
+In administrator mode, `lista las personas` speaks the saved names, and `borra` plus the name asks sí or no before deleting that person, their prints, and their `raw/` folder. If the deleted name is `locked`, the lock is cleared and any voice can speak again until the next enrollment. These two orders do nothing without administrator mode.
 
-`comando identifica mi voz` enrolls the speaker by voice. It starts with the name. Two words in a row, such as Jose Antonio, are one person. If this voice or that name is already saved, it says it is the same person and asks whether to repeat the identification. If the name is not saved, it says so and asks whether to store it as another person. A no means “Di otro nombre.” Only a yes keeps the name. The same name replaces those prints and does not create another person. After the yes, it speaks four phrases (`hola grok`, `estás ahí`, `qué hora es`, `pon una canción`), three times each, and waits after every one for the repeat. The screen also shows `DI:` and `OI:`, but looking at it is not required. Each take is its own print, up to 12 under the confirmed name. Later speech matches the closest print. When it finishes, that name is the only voice the assistant will hear: wake, commands, confirmations, and the open conversation. Every other print is ignored, except that any person may say `comando identifica mi voz` to enroll a new voice. `salir` cancels. Until this command has been completed once, no voice is locked. An unidentified lane such as `voz 78` is temporary and is deleted after 10 seconds without use. It is not stored.
+`comando identifica mi voz` enrolls one person, once. The dialogue, the sixteen phrases, the 0.55 group of at least 12, and the engine scores are in Voice footprint above. The screen shows `DI:` and `OI:`, and looking at it is not required. `salir` cancels. When it finishes, that name is `locked` and is the only voice the assistant will hear.
 
-After `identifica mi voz`, the saved name in `speakers.json` under `locked` is the only voice that is heard. That covers the wake, every `comando`, the yes or no after a question, and the whole conversation. Any other print is ignored, including someone else saying `hola grok`. Only that voice can run `identifica mi voz` again. Until the command has been completed once, `locked` is empty and a wake or a `comando` can come from whoever is speaking. In that unlocked state, an open conversation still follows only the voice that opened it.
+After `identifica mi voz`, the name in `locked` is the only voice that is heard. That covers the wake, every `comando`, the yes or no after a question, identifying again, and the whole conversation. Any other print is ignored, including someone else saying `hola grok`. Until `locked` is set, a wake or a `comando` can come from whoever is speaking. In that unlocked state, an open conversation still follows only the voice that opened it. A print stored before this change, with no CampPlus vectors, still matches at 0.30 so that person can speak and can record again. A new CampPlus print matches at 0.55.
+
+`comando personalidad` says the current personality, or “Sin personalidad.” `comando personalidad` plus an id or a name from `personalities.json` switches to that person. The spoken answer keeps the persona. The command interpreter does not.
 
 A single microphone cannot split two people who speak at the same instant. `gracias` or `vale` alone ends the talk, and only if that phrase is the locked voice. `gracias` is answered `De nada.` and `vale` is answered `Vale.`
 
@@ -220,7 +260,7 @@ The first boot line comes from `hellos-es.txt`, in order, one per start.
 
 - `systemctl is-enabled wifi-boot` prints `enabled`. `grok-assistant` prints `disabled` and is inactive until Wi-Fi boot or a manual start. There is no service in this project that configures the screen or the sound card.
 - `arecord -L` shows a default capture device when the operating system has a microphone.
-- The journal line `listening on default` appears when the OS has a capture device, then `reconocedor activo: Kroko` and `voz activa: Dave, España`.
-- The panel shows the command list, `TEMP` from the CPU, and the bottom line changes from `(silencio)` to `escuchando…` when someone speaks.
+- The journal line `listening on default` appears when the OS has a capture device, then `reconocedor activo: Kroko`, `voz activa: Dave, España`, and `motor escucha: Kroko. huellas combinadas: aún no hay porcentajes.` until a sixteen-phrase recording has been scored.
+- The panel shows the command list, including personalidad and the sixteen-phrase enrollment line, `TEMP` from the CPU, and the bottom line changes from `(silencio)` to `escuchando…` when someone speaks.
 - `hola` gets `Hola.` and does not call the network.
-- `comando identifica mi voz` asks whether the voice is the person already saved or another name. The same name replaces that person’s prints. A new confirmed name is stored as another person and becomes the only voice that is heard. Then it speaks each phrase, shows `DI:` / `OI:`, writes the prints into `speakers.json`, and sets `locked` to the confirmed name. After that, another voice saying `hola` is ignored.
+- `comando identifica mi voz` asks “¿Cómo te llamas?”, confirms a saved voice or a new name, speaks sixteen phrases once, and keeps a group of at least 12 that match at cosine 0.55. It writes CampPlus prints and wavs, sets `locked`, and scores the installed engines. After that, another voice saying `hola` is ignored. Only the locked voice can identify again.
