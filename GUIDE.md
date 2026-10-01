@@ -54,7 +54,7 @@ Say `comando` and then the line.
 | para la música | Stops the song. |
 | apaga el dispositivo | Asks «¿Apago el dispositivo? Di sí o no.» Only a yes from the locked voice powers the Pi off. |
 | prueba | Writes what the selected engine hears, and the engine’s name under it. Runs nothing, until you say `salir`. |
-| identifica mi voz | Records this person. Sixteen phrases, once. |
+| identifica mi voz | Records this person. Sixteen phrases, once. Silence keeps the microphone on this phrase. `seguir` keeps it. `salir` drops this recording and writes nothing. |
 
 `ayuda` shows this list again and speaks a short reminder. It does not require administrator mode.
 
