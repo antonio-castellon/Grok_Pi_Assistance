@@ -3819,41 +3819,57 @@ def run_voice_enrollment(
     failures = 0
     phrases = enroll_phrases()
     total = len(phrases)
-    speak(
-        speech,
-        (
-            f"Grabaré {total} frases una sola vez. Guardo el sonido en crudo, sin comprobar las palabras. "
-            "El sonido vale para todos los motores. Habla después del pitido, y espera el segundo pitido."
-        ),
-        speaker,
-    )
+    speak(speech, "Seguir pasa a la frase siguiente. Salir tira esta grabación.", speaker)
+    _play_tone(880, 0.14, speaker, block=True)
     index = 0
     while index < total:
         prompt = phrases[index]
         speak(speech, f"{index + 1} de {total}. {prompt}", speaker)
-        heard, audio = _enroll_listen(speech, mic, display, speaker, prompt)
-        if _enroll_stopped(heard):
+        if not mic.ensure_open():
+            speak(speech, "No oigo el micrófono. Lo dejo.", speaker)
+            return
+        _pause_and_clear(mic, 0.1)
+        heard, audio, alive = _enroll_phrase(speech, mic, display, prompt)
+        if not alive:
+            speak(speech, "Cancelo la identificación.", speaker)
+            return
+        heard, audio, decision = split_phrase_decision(heard, audio)
+        if not decision:
+            decision = _enroll_choice(speech, mic, display, prompt)
+        if decision == "salir":
+            speak(speech, "Salgo. No guardo los audios de esta huella.", speaker)
+            return
+        if not decision:
             speak(speech, "Cancelo la identificación.", speaker)
             return
         has_samples = audio is not None and int(getattr(audio, "size", 0)) > 0
         captured = book.capture(audio) if has_samples else None
+        step = enroll_followup(decision, has_samples, captured is not None, heard)
+        if step == "empty":
+            log.info("huella: nada, sigo en la misma · %s", speech.asr_label)
+            speak(speech, "No he oído esta frase. Sigo en la misma.", speaker)
+            _play_tone(880, 0.14, speaker, block=True)
+            continue
         log_enroll_take(heard, has_samples, speech.asr_label)
-        outcome = enroll_result(has_samples, captured is not None, heard)
-        if outcome == "keep" and captured is not None:
+        if step == "keep" and captured is not None:
             failures = 0
             vector, wave_audio = captured
             taken.append((prompt, wave_audio, vector))
             index += 1
+            _play_tone(494, 0.22, speaker, block=True)
             continue
         failures += 1
         if failures >= 3:
-            if outcome == "retry":
+            if heard.strip():
                 speak(speech, f"He oído: {heard.strip()}. No he cogido la huella. Lo dejo.", speaker)
             else:
                 speak(speech, "No oigo el micrófono. Lo dejo.", speaker)
             return
-        if outcome == "retry":
+        if heard.strip():
             speak(speech, f"He oído: {heard.strip()}. No he cogido la huella. Repite.", speaker)
+        else:
+            speak(speech, "No he cogido la huella. Repite.", speaker)
+        _play_tone(880, 0.14, speaker, block=True)
     group = largest_voice_group([item[2] for item in taken])
     if len(group) < 12:
         speak(speech, "Estas tomas no son una sola voz. No guardo a otra persona.", speaker)
@@ -6407,6 +6423,11 @@ _tone_path = pi_extra._tone_path
 _play_tone = pi_extra._play_tone
 _enroll_take = pi_extra._enroll_take
 _enroll_listen = pi_extra._enroll_listen
+enroll_decision = pi_extra.enroll_decision
+split_phrase_decision = pi_extra.split_phrase_decision
+enroll_followup = pi_extra.enroll_followup
+_enroll_phrase = pi_extra._enroll_phrase
+_enroll_choice = pi_extra._enroll_choice
 enroll_result = pi_extra.enroll_result
 log_enroll_take = pi_extra.log_enroll_take
 is_presence_phrase = pi_extra.is_presence_phrase
