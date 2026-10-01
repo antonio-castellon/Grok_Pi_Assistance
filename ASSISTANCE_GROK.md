@@ -164,7 +164,7 @@ Silence of about 3.5 seconds ends one phrase. A phrase may last up to 45 seconds
 
 A local command does not need the perfect string. Match the command words with the usual alternates (`apaga` / `apagar`, `otro` / `siguiente`, `hola grok` / `hola grop` / `pola grove`) and still accept the phrase when one character is inserted, deleted, or substituted. `otro reconocedor` and `otro reconocedot` are the same command. Two wrong characters are not. This is only the local fast path. If it still does not match, Grok may reinterpret it, and that result waits for sí or no.
 
-On the Pi the spoken admin key is digits and uses that same one-character rule. A single digit does not match. The desktop app does not speak that key and does not ship it: the tray password is checked against the salted hash, as typed.
+On the Pi the spoken admin key, when one is set, uses that same one-character rule. A single digit does not match. The key is not in the repository. It lives only in the machine file `~/.config/grok-assistant/config.json`. An empty key means administrator mode does not open. The desktop app does not speak that key and does not ship it: the tray password is checked against the salted hash, as typed.
 
 ## Administrator password
 
@@ -252,9 +252,9 @@ English proper names are the weak spot of a Spanish-only recognizer: it writes t
 
 ## Do not copy from the Pi
 
-Do not copy the framebuffer, the touch logo, the Wi-Fi setup boot screen, the WM8960 mixer, the fan, or the 480×320 layout. Do not copy the Pi sudo password. The desktop password is the one set in the tray, stored only as a hash. Shutdown may call the operating system's normal shutdown after the spoken sí or no.
+The Pi draws on the framebuffer the operating system assigned (`fb0`) and plays and records on the ALSA default devices. It does not configure HDMI, a panel, or a sound card, and it does not ship a password or a token. The desktop password is the one set in the tray, stored only as a hash. Shutdown may call the operating system's normal shutdown after the spoken sí or no.
 
-The Pi program is the private repository `antonio-castellon/Grok_Pi_Assistance`. `install-pi.sh` in that tree is the clean Raspberry Pi OS installer. It is not the desktop tray installer. Do not copy `sudo.pass`, `speakers.json`, or the speech-model files into the repository. The script downloads the models.
+The Pi program is the private repository `antonio-castellon/Grok_Pi_Assistance`. `install-pi.sh` in that tree is the clean Raspberry Pi OS installer. It is not the desktop tray installer. Do not copy `speakers.json`, a sudo password, or an API token into the repository. The script downloads the models.
 
 ## Done when
 

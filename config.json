@@ -1,6 +1,6 @@
 {
   "language": "es",
-  "admin_key": "1515",
+  "admin_key": "",
   "playback_device": "auto",
   "capture_device": "auto",
   "wake_phrases": ["despierta grok"],
