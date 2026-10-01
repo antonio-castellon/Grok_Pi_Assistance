@@ -1,6 +1,6 @@
 # Grok voice assistant — Raspberry Pi
 
-This file is how to build the machine that is running now. The other file, `ASSISTANCE_GROK.md`, is the desktop tray clone. Do not follow that one for a Pi.
+This file is how to build the machine that is running now. The desktop tray app is a separate repository, [antonio-castellon/grok_assistant](https://github.com/antonio-castellon/grok_assistant). Do not follow that one for a Pi.
 
 The live tree is `/home/antonio/grok-assistant`. The user is `antonio`. Spoken language is Spanish. Answers are short. Speech has no markdown, lists, emoji, or code.
 
@@ -192,7 +192,7 @@ While music is audible the microphone is off. The buttons are `PAUSA` / `SEGUIR`
 
 ## What the running program does
 
-The rules of the talk are the ones in `ASSISTANCE_GROK.md`. On this Pi they are implemented in `assistant.py`, not in a tray app. The differences that matter for a second Pi are these.
+The rules of the talk below are what this Pi runs. They are implemented in `assistant.py`, not in a tray app. The desktop tray app is the separate repository `grok_assistant`.
 
 Wake, with no cloud call and no search: `hola grok` (and close mishearings such as `hola grok` cut short, `hola grop`, `pola grove`), a short `hola` on its own, or `¿estás ahí, Grok?` / `Grok, ¿estás ahí?`. The answer is `Hola.` or `Sí, aquí estoy.` The words that came with the wake are not sent anywhere. The assistant then waits.
 

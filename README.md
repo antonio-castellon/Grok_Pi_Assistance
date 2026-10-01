@@ -2,7 +2,7 @@
 
 Spanish voice assistant for a Raspberry Pi. It listens and speaks on the sound devices Raspberry Pi OS already selected, and it draws on the framebuffer the OS assigned (`fb0`). Exact local orders run on the Pi. Questions go to Grok in the cloud. There is no on-device Grok model.
 
-The behavior of the running program is in [PI_ASSISTANCE_GROK.md](PI_ASSISTANCE_GROK.md). [ASSISTANCE_GROK.md](ASSISTANCE_GROK.md) is the desktop tray clone, not the Pi.
+The behavior of the running program is in [PI_ASSISTANCE_GROK.md](PI_ASSISTANCE_GROK.md). The desktop tray app is the separate repository [antonio-castellon/grok_assistant](https://github.com/antonio-castellon/grok_assistant).
 
 ## Clean install
 
