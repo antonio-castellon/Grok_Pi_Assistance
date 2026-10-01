@@ -4,7 +4,7 @@ This file is how to build the machine that is running now. The desktop tray app 
 
 The live tree is `/home/antonio/grok-assistant`. The user is `antonio`. Spoken language is Spanish. Answers are short. Speech has no markdown, lists, emoji, or code.
 
-The same tree is the private repository [antonio-castellon/Grok_Pi_Assistance](https://github.com/antonio-castellon/Grok_Pi_Assistance).
+The same tree is the repository [antonio-castellon/Grok_Pi_Assistance](https://github.com/antonio-castellon/Grok_Pi_Assistance).
 
 ## Clean install
 
