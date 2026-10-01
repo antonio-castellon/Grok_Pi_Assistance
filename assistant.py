@@ -11,6 +11,7 @@ import argparse
 from collections import deque
 from datetime import datetime, timedelta, timezone
 import gzip
+import hashlib
 import itertools
 import json
 import mmap
@@ -446,6 +447,59 @@ def os_status_line() -> str:
     return f"{pretty} · {release} {info.machine}"
 
 
+def git_blob_sha(path: Path) -> str:
+    data = path.read_bytes()
+    return hashlib.sha1(f"blob {len(data)}\0".encode() + data).hexdigest()
+
+
+def _github_json(path: str) -> dict | None:
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        "https://api.github.com" + path,
+        headers={"User-Agent": "grok-assistant", "Accept": "application/vnd.github+json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=2) as response:
+            data = json.loads(response.read().decode())
+    except (OSError, urllib.error.URLError, json.JSONDecodeError, TimeoutError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def running_build() -> str:
+    """Seven characters of the code that is running.
+
+    When assistant.py and pi_extra.py match the published main commit, those
+    characters are that commit. Otherwise they hash the two files on disk.
+    """
+    names = ("assistant.py", "pi_extra.py")
+    local: dict[str, str] = {}
+    try:
+        for name in names:
+            local[name] = git_blob_sha(ROOT / name)
+    except OSError:
+        return ""
+    fallback = hashlib.sha1("".join(local[name] for name in names).encode()).hexdigest()[:7]
+    ref = _github_json("/repos/antonio-castellon/Grok_Pi_Assistance/git/ref/heads/main")
+    commit = str(((ref or {}).get("object") or {}).get("sha") or "")
+    if len(commit) < 7:
+        return fallback
+    info = _github_json(f"/repos/antonio-castellon/Grok_Pi_Assistance/git/commits/{commit}")
+    tree = str(((info or {}).get("tree") or {}).get("sha") or "")
+    if not tree:
+        return fallback
+    listing = _github_json(f"/repos/antonio-castellon/Grok_Pi_Assistance/git/trees/{tree}?recursive=1")
+    blobs: dict[str, str] = {}
+    for item in (listing or {}).get("tree") or []:
+        if isinstance(item, dict) and item.get("path") in names:
+            blobs[str(item["path"])] = str(item.get("sha") or "")
+    if all(blobs.get(name) == local[name] for name in names):
+        return commit[:7]
+    return fallback
+
+
 def panel_fb() -> str:
     """The framebuffer the operating system assigned. fb0 is that console."""
     if Path("/sys/class/graphics/fb0").is_dir():
@@ -534,6 +588,9 @@ class HeardDisplay:
         self._wifi_at = 0.0
         self.asr_name = "Kroko"
         self.os_line = os_status_line()
+        self.build_label = running_build()
+        self.os_row_y = -1
+        log.info("build %s", self.build_label or "—")
         self.listening = True
         self.in_conversation = False
         self.in_test = False
@@ -739,7 +796,8 @@ class HeardDisplay:
         self._wifi_shown = ""
         self._paint_wifi()
         y += self.font_h
-        self._text(4, y, self.os_line, (170, 196, 214), self.width - 4)
+        self.os_row_y = y
+        self._paint_os_line()
         y += self.font_h + 3
         reserve = self.font_h + self.small_h + 22
         cmd_bottom = self._paint_command_grid(y, self.height - reserve)
@@ -956,6 +1014,30 @@ class HeardDisplay:
             self.voice_row_y + 2,
             text,
             color,
+            self.small_glyphs,
+            self.small_w,
+            self.small_h,
+            self.width - 2,
+        )
+
+    def _paint_os_line(self) -> None:
+        """OS name on the left. The running build stays at the end of that row."""
+        if self.mem is None or self.os_row_y < 0:
+            return
+        build = f"build {self.build_label}" if self.build_label else ""
+        y = self.os_row_y
+        self._fill(0, y, self.width, self.font_h, (8, 16, 32))
+        build_w = len(build) * self.small_w
+        gap = 8 if build else 0
+        limit = self.width - 4 - build_w - gap
+        self._text(4, y, self.os_line, (170, 196, 214), max(4, limit))
+        if not build or limit <= 4:
+            return
+        self._text_in(
+            self.width - 4 - build_w,
+            y + 2,
+            build,
+            (186, 214, 232),
             self.small_glyphs,
             self.small_w,
             self.small_h,
