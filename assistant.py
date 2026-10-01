@@ -94,6 +94,7 @@ SYSTEM_PROMPT_ES = (
     "COMANDO: reconocedor kroko. COMANDO: reconocedor whisper. "
     "COMANDO: reconocedor base. COMANDO: reconocedor small. COMANDO: reconocedor canary. "
     "COMANDO: personalidad. COMANDO: personalidad vega. "
+    "COMANDO: nombre. COMANDO: nombre Miguel. "
     "No pidas clave para esos."
 )
 
@@ -139,6 +140,7 @@ def load_config() -> dict:
         cfg.update(override)
     cfg["playback_device"] = str(cfg["playback_device"])
     cfg["capture_device"] = str(cfg["capture_device"])
+    cfg["assistant_name"] = apply_assistant_name(str(cfg.get("assistant_name") or "Grok"))
     return cfg
 
 
@@ -1342,6 +1344,88 @@ def _folded_words(text: str) -> str:
     return re.sub(r"\s+", " ", folded).strip()
 
 
+# How the user calls the assistant. "Grok" is the default. A Spanish name is
+# easier for the Spanish ear than that English word.
+ASSISTANT_NAME = "Grok"
+_NAME_STOP = {
+    "comando", "comandos", "salir", "cancela", "cancelar", "si", "no", "vale",
+    "gracias", "adios", "hola", "ola", "ok", "ayuda", "prueba", "personalidad",
+    "volumen", "musica", "cancion", "agente", "sesion", "administrador",
+    "identifica", "voz", "nombre",
+}
+
+
+def clean_assistant_name(text: str) -> str:
+    """A short call-name, such as Miguel. Empty when it is not a name."""
+    raw = (text or "").strip().strip(".,;:!?¿¡\"'")
+    parts = [part.strip(".,;:!?¿¡\"'") for part in raw.split() if part.strip(".,;:!?¿¡\"'")]
+    folded = [_folded_words(part) for part in parts]
+    if folded and folded[0] in {"hola", "ola", "jola"}:
+        parts = parts[1:]
+        folded = folded[1:]
+    if not parts or len(parts) > 2 or any(not word for word in folded):
+        return ""
+    if any(len(word) < 2 or len(word) > 16 or word in _NAME_STOP for word in folded):
+        return ""
+    if any(not re.fullmatch(r"[a-zñ]+", word) for word in folded):
+        return ""
+    if folded == ["grok"]:
+        return "Grok"
+    return " ".join(part[:1].upper() + part[1:] for part in parts)
+
+
+def apply_assistant_name(text: str) -> str:
+    """Remember the call-name. A blank or unusable value stays Grok."""
+    global ASSISTANT_NAME
+    cleaned = clean_assistant_name(text) or "Grok"
+    ASSISTANT_NAME = cleaned
+    return cleaned
+
+
+def assistant_call() -> str:
+    """The wake the footprint asks for. Default is hola grok."""
+    if _folded_words(ASSISTANT_NAME) == "grok":
+        return "hola grok"
+    return "hola " + ASSISTANT_NAME
+
+
+def _custom_name_words() -> list[str]:
+    words = _folded_words(ASSISTANT_NAME).split()
+    if not words or words == ["grok"]:
+        return []
+    return words
+
+
+def _span_close(heard: list[str], wanted: list[str]) -> bool:
+    if len(heard) != len(wanted):
+        return False
+    return all(_edit_distance(left, right) <= 1 for left, right in zip(heard, wanted))
+
+
+def _custom_hello(folded: str) -> bool:
+    wanted = _custom_name_words()
+    if not wanted or not folded:
+        return False
+    words = folded.split()
+    hellos = {"hola", "ola", "jola", "pola", "bola"}
+    size = len(wanted)
+    for index, word in enumerate(words):
+        if word in hellos and _span_close(words[index + 1:index + 1 + size], wanted):
+            return True
+    return False
+
+
+def _custom_there(folded: str) -> bool:
+    wanted = _custom_name_words()
+    if not wanted or not folded:
+        return False
+    if not re.search(r"\b(?:estas|esta)\s+(?:ahi|alli|hay|ai|ay)\b", folded):
+        return False
+    words = folded.split()
+    size = len(wanted)
+    return any(_span_close(words[index:index + size], wanted) for index in range(len(words) - size + 1))
+
+
 # "hola grok" often arrives as "hola grop", "pola grove" or one word "holagro".
 HELLO_GROK = (
     rf"(?:(?:hola|ola|jola|pola|bola)\s+(?:{GROK_NAME}|grop\w*|agro\w*|gro\b|grove\w*|grov\w*|group\w*|crove\w*|holagro\w*|holagrok\w*)"
@@ -1353,16 +1437,20 @@ _COMANDO_WORD = {"comando", "comandos", "comado", "komando", "comand"}
 
 
 def find_hola_grok(text: str) -> bool:
-    """True if 'hola grok' appears anywhere, including the usual mishearings."""
+    """True if 'hola grok' or 'hola' plus the chosen name appears."""
     folded = _folded_words(text)
-    return bool(folded and re.search(HELLO_GROK, folded))
+    if folded and re.search(HELLO_GROK, folded):
+        return True
+    return _custom_hello(folded)
 
 
 def find_grok_there(text: str) -> bool:
-    """'Grok, ¿estás ahí?' or '¿estás ahí, Grok?'."""
+    """'Grok, ¿estás ahí?' or the same shape with the chosen name."""
     folded = _folded_words(text)
     if not folded:
         return False
+    if _custom_there(folded):
+        return True
     there = r"(?:estas|esta)\s+(?:ahi|alli|hay|ai|ay)"
     if re.search(rf"(?:{GROK_NAME}).{{0,30}}{there}", folded):
         return True
@@ -1665,9 +1753,30 @@ def is_real_phrase(text: str) -> bool:
     return not (len(words) == 1 and words[0] in noise)
 
 
+def _strip_custom_wake(raw: str) -> str | None:
+    """Words after 'hola NAME' when NAME is the chosen call-name. None otherwise."""
+    wanted = _custom_name_words()
+    if not wanted:
+        return None
+    folded = _folded_words(raw).split()
+    hellos = {"hola", "ola", "jola", "pola", "bola"}
+    size = len(wanted)
+    if len(folded) < 1 + size or folded[0] not in hellos:
+        return None
+    if not _span_close(folded[1:1 + size], wanted):
+        return None
+    original = raw.split()
+    if len(original) < 1 + size:
+        return ""
+    return " ".join(original[1 + size:]).strip(" .,;:!?¿¡")
+
+
 def raw_after_wake(text: str) -> str:
     """The words after the wake phrase, taken from the recognizer text."""
     raw = text.strip()
+    custom = _strip_custom_wake(raw)
+    if custom is not None:
+        return custom
     wake_name = r"gro[cfgk]\w*|grog\w*|gorf\w*|dro[cfgk]\w*|drog\w*|cro[cfgk]\w*|croc\w*|crock\w*|bro[cfgk]\w*|brock\w*|tro[cfgk]\w*|trog\w*|rock|group"
     patterns = (
         rf"(?i)^(?:ok|okay|oc|vale)\b[\s,]*\b(?:{wake_name})\b[\s,.:;!?¿¡]*",
@@ -2904,6 +3013,8 @@ def canonicalize(phrase: str, pending: str) -> str:
         "reconocedor canary\n"
         "personalidad\n"
         "personalidad <nombre>\n"
+        "nombre\n"
+        "nombre <nombre>\n"
         "identifica mi voz\n"
         "listar sesiones\n"
         "cerrar sesion\n"
@@ -2932,6 +3043,8 @@ def canonicalize(phrase: str, pending: str) -> str:
         "reconocedor whisper pequeño -> reconocedor whisper. "
         "pon la personalidad vega, personalidad vega -> personalidad vega. "
         "qué personalidad tienes -> personalidad. "
+        "te llamas miguel, llamarte miguel, tu nombre es miguel -> nombre miguel. "
+        "cómo te llamas, cuál es tu nombre -> nombre. "
         "identifica mi voz, graba mi voz -> identifica mi voz. "
         "explícame los comandos, qué puedo decir, pon ejemplos -> ayuda. "
         "quiero una sesión que se llame casa de campo -> crear sesion casa de campo.\n"
@@ -2971,7 +3084,7 @@ INTERPRET_SYSTEM = (
     "subir volumen, bajar volumen, otra voz, voz N, pon cancion TITULO, "
     "pausa musica, seguir musica, para la musica, otro reconocedor, "
     "reconocedor kroko, reconocedor whisper, reconocedor base, reconocedor small, reconocedor canary, "
-    "personalidad, personalidad NOMBRE, identifica mi voz, "
+    "personalidad, personalidad NOMBRE, nombre, nombre NOMBRE, identifica mi voz, "
     "listar sesiones, crear sesion NOMBRE, abrir sesion NOMBRE, cerrar sesion, "
     "borrar sesion NOMBRE, listar agentes, abrir agente NOMBRE, crear agente NOMBRE, "
     "cerrar agente, apagar, ayuda, prueba. "
@@ -3345,8 +3458,9 @@ def is_help(text: str) -> bool:
 
 
 def help_lines() -> list[tuple[str, str]]:
+    call = assistant_call()
     return [
-        ("iniciar: \"hola grok\" o \"¿estás ahí?\"   acabar: \"gracias\" o \"vale\"", "talk"),
+        (f"iniciar: \"{call}\" o \"¿estás ahí?\"   acabar: \"gracias\" o \"vale\"", "talk"),
         ("COMANDOS (iniciar con palabra \"comando\")", "header"),
         ("SESION ( abrir ¦ crear ¦ borrar ) NOMBRE , listar , cerrar", "group"),
         ("AGENTE ( abrir ¦ crear ) NOMBRE , listar , cerrar", "group"),
@@ -3357,6 +3471,7 @@ def help_lines() -> list[tuple[str, str]]:
         ("otra voz", "pasa a la siguiente"),
         ("otro reconocedor", "Kroko, Whisper, base, small o Canary"),
         ("personalidad", "alex, vega, nico…"),
+        ("nombre NOMBRE", "la primera frase de la huella"),
         ("pon la canción X", "suena solo el audio"),
         ("para la música", "corta la canción"),
         ("apaga el dispositivo", "pide sí y lo apaga"),
@@ -3366,14 +3481,17 @@ def help_lines() -> list[tuple[str, str]]:
 
 
 def help_speech() -> str:
+    call = assistant_call()
+    call = call[:1].upper() + call[1:]
     return (
-        "Hola grok abre la conversación. Adiós o gracias la cierra. "
+        f"{call} abre la conversación. Adiós o gracias la cierra. "
         "Las demás órdenes empiezan por la palabra comando. "
         "Comando otra voz. Comando subir volumen. Comando pon la canción y el título. "
         "Comando apaga el dispositivo, y si dices sí, se apaga. "
         "Comando modo administrador, y después la clave, solo para tareas del sistema. "
         "Comando otro reconocedor cambia entre Kroko, Whisper, base, small y Canary. "
         "Comando personalidad elige una de las ocho. "
+        "Comando nombre, y un nombre, cambia cómo se le llama. "
         "Comando identifica mi voz graba dieciséis frases, una sola vez, después del pitido."
     )
 
@@ -3435,6 +3553,32 @@ ENROLL_LINES = (
     "cómo estás",
     "dime la hora",
 )
+
+
+def enroll_phrases() -> tuple[str, ...]:
+    """The sixteen phrases. The first one is hola plus the chosen call-name."""
+    return (assistant_call(), *ENROLL_LINES[1:])
+
+
+def assistant_name_command(text: str) -> tuple[str, str] | None:
+    """('show', '') or ('set', spoken name). The footprint then starts with that name."""
+    folded = _folded_words(text)
+    words = folded.split()
+    if not words or len(words) > 6:
+        return None
+    if words[0] == "nombre" or (len(words) >= 2 and words[0] == "tu" and words[1] == "nombre"):
+        rest = words[2:] if words[0] == "tu" else words[1:]
+        rest = [word for word in rest if word not in {"es", "de", "del", "se", "llama", "te", "un", "el"}]
+        if not rest or rest[0] in {"cual", "que", "como", "actual"}:
+            return ("show", "")
+        return ("set", " ".join(rest))
+    if re.search(r"\b(llamas|llamarte|llamate)\b", folded):
+        rest = re.sub(r"^.*\b(?:llamas|llamarte|llamate)\b", "", folded).strip()
+        rest = re.sub(r"^(?:te|a|ahora)\s+", "", rest).strip()
+        if not rest:
+            return ("show", "")
+        return ("set", rest)
+    return None
 
 
 def people_command(text: str) -> tuple[str, str] | None:
@@ -3588,7 +3732,8 @@ def run_voice_enrollment(
         return
     taken: list[tuple[str, np.ndarray, np.ndarray]] = []
     failures = 0
-    total = len(ENROLL_LINES)
+    phrases = enroll_phrases()
+    total = len(phrases)
     speak(
         speech,
         (
@@ -3599,7 +3744,7 @@ def run_voice_enrollment(
     )
     index = 0
     while index < total:
-        prompt = ENROLL_LINES[index]
+        prompt = phrases[index]
         speak(speech, f"{index + 1} de {total}. {prompt}", speaker)
         heard, audio = _enroll_listen(speech, mic, display, speaker, prompt)
         if _enroll_stopped(heard):
@@ -4871,6 +5016,22 @@ def apply_waiting_command(
             shown = int(getattr(speech, "voice_index", 0)) + 1
             speak(speech, f"Voz {shown}. {label}.", speaker)
         display.note_voice(speech)
+        return "used"
+    named = assistant_name_command(text)
+    if named:
+        kind, wanted = named
+        if kind == "show":
+            speak(speech, f"Me llamo {ASSISTANT_NAME}. Para empezar se dice {assistant_call()}.", speaker)
+        else:
+            cleaned = clean_assistant_name(wanted)
+            if not cleaned:
+                speak(speech, "Ese nombre no vale. Di un nombre corto.", speaker)
+            else:
+                cfg["assistant_name"] = apply_assistant_name(cleaned)
+                save_user_config({"assistant_name": cfg["assistant_name"]})
+                speak(speech, f"A partir de ahora se dice {assistant_call()}.", speaker)
+                display._static_ready = False
+                display._draw(display.shown, display.level)
         return "used"
     persona = personality_command(text)
     if persona:
