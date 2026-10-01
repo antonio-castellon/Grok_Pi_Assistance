@@ -55,8 +55,7 @@ USER_CONFIG = Path.home() / ".config" / "grok-assistant" / "config.json"
 RATE = 16000
 CHUNK_FRAMES = 1600  # 100 ms
 
-JACK = "plughw:CARD=Headphones,DEV=0"
-HDMI = "plughw:CARD=vc4hdmi0,DEV=0"
+
 
 SYSTEM_PROMPT = (
     "You are Grok, a voice assistant on a Raspberry Pi in the room with the user. "
@@ -189,12 +188,7 @@ def play_wav(path: Path, device: str) -> bool:
 
 
 def play_on(path: Path, device: str) -> bool:
-    if play_wav(path, device):
-        return True
-    if device != JACK and play_wav(path, JACK):
-        log.warning("played on the headphone jack instead of %s", device)
-        return True
-    return False
+    return play_wav(path, device)
 
 
 def list_alsa_devices(program: str) -> list[tuple[str, str]]:
@@ -213,23 +207,20 @@ def list_capture_devices() -> list[str]:
 
 
 def resolve_capture(cfg: dict) -> str | None:
+    """The capture device the OS exposes. auto is the ALSA default."""
     if cfg["capture_device"] != "auto":
         return cfg["capture_device"]
-    devices = list_alsa_devices("arecord")
-    for name, device in devices:
-        if "wm8960" in name.lower():
-            return device
-    return devices[0][1] if devices else None
+    if not list_capture_devices():
+        return None
+    return "default"
 
 
 def resolve_playback(cfg: dict) -> str:
+    """The playback device the OS exposes. auto is the ALSA default."""
     choice = str(cfg.get("playback_device") or "auto")
     if choice != "auto":
         return choice
-    for name, device in list_alsa_devices("aplay"):
-        if "wm8960" in name.lower():
-            return device
-    return JACK
+    return "default"
 
 
 class Mic:
@@ -438,24 +429,25 @@ def os_status_line() -> str:
 
 
 def panel_fb() -> str:
-    """The small SPI panel, even when HDMI has taken fb0."""
-    graphics = Path("/sys/class/graphics")
-    for node in sorted(graphics.glob("fb[0-9]*")):
-        try:
-            name = (node / "name").read_text(encoding="ascii", errors="replace").lower()
-        except OSError:
-            continue
-        if "ili9486" in name or "piscreen" in name:
-            return node.name
-    return "fb0"
+    """The framebuffer the operating system assigned. fb0 is that console."""
+    if Path("/sys/class/graphics/fb0").is_dir():
+        return "fb0"
+    found = sorted(Path("/sys/class/graphics").glob("fb[0-9]*"))
+    return found[0].name if found else "fb0"
 
 
-def panel_rotation() -> int:
+def _axis_limits(fd: int, code: int) -> tuple[int, int]:
+    """Minimum and maximum the kernel reports for one touch axis."""
+    import fcntl
+
     try:
-        raw = open("/proc/device-tree/soc/spi@7e204000/piscreen@0/rotate", "rb").read()
-        return int.from_bytes(raw[:4], "big")
+        raw = fcntl.ioctl(fd, 0x80184540 + code, b"\0" * 24)
     except OSError:
-        return 180
+        return 0, 1
+    _value, lo, hi, _fuzz, _flat, _resolution = struct.unpack("6i", raw[:24])
+    if hi <= lo:
+        return 0, 1
+    return lo, hi
 
 
 def touch_device() -> str | None:
@@ -473,7 +465,7 @@ def touch_device() -> str | None:
         finally:
             os.close(fd)
         label = name.split(b"\0", 1)[0]
-        if b"ADS7846" in label or b"Touchscreen" in label:
+        if b"touchscreen" in label.lower():
             return str(node)
     return None
 
@@ -539,7 +531,9 @@ class HeardDisplay:
         self._announce: str | None = None
         self._ann_lock = threading.Lock()
         self._last_tap = 0.0
-        self.rotation = panel_rotation()
+        self.rotation = 0
+        self.touch_x = (0, 1)
+        self.touch_y = (0, 1)
         self.last_text = ""
         self.last_draw = 0.0
         try:
@@ -598,7 +592,7 @@ class HeardDisplay:
 
     def note_volume(self) -> None:
         value = current_playback()
-        line = "Volumen —" if value is None else f"Volumen {round(value * 100 / 255)}%"
+        line = "Volumen —" if value is None else f"Volumen {value}%"
         if line != self.volume_line:
             self.volume_line = line
             self._static_ready = False
@@ -1113,19 +1107,7 @@ class HeardDisplay:
         return value.to_bytes(2, "little")
 
     def _map_touch(self, raw_x: int, raw_y: int) -> tuple[int, int]:
-        # The kernel already swaps x/y. These end points are the Waveshare
-        # 3.5" map for a panel turned 180 degrees: x grows to the right,
-        # y grows downward from a high raw value.
-        if self.rotation == 180:
-            # Top of the panel is a low raw Y. The left side, where pause and
-            # stop are drawn, arrives as a high raw X, so that axis is reversed.
-            x_lo, x_hi, y_lo, y_hi = 3932, 300, 294, 3801
-        elif self.rotation == 0:
-            x_lo, x_hi, y_lo, y_hi = 3932, 300, 294, 3801
-        elif self.rotation == 90:
-            x_lo, x_hi, y_lo, y_hi = 3801, 294, 300, 3932
-        else:
-            x_lo, x_hi, y_lo, y_hi = 294, 3801, 3932, 300
+        """Map a touch into the framebuffer using the ranges the kernel reports."""
 
         def axis(raw: int, lo: int, hi: int, size: int) -> int:
             span = hi - lo
@@ -1135,6 +1117,8 @@ class HeardDisplay:
             pos = min(1.0, max(0.0, pos))
             return int(pos * (size - 1))
 
+        x_lo, x_hi = self.touch_x
+        y_lo, y_hi = self.touch_y
         return axis(raw_x, x_lo, x_hi, self.width), axis(raw_y, y_lo, y_hi, self.height)
 
     def _sync_music(self) -> bool:
@@ -1236,7 +1220,9 @@ class HeardDisplay:
         except OSError as exc:
             log.warning("táctil no disponible: %s", exc)
             return
-        log.info("táctil %s rotación %s", path, self.rotation)
+        self.touch_x = _axis_limits(fd, 0)
+        self.touch_y = _axis_limits(fd, 1)
+        log.info("táctil %s ejes %s %s", path, self.touch_x, self.touch_y)
         event = struct.Struct("qqHHi")
         raw_x = raw_y = 0
         have_point = False
@@ -1522,7 +1508,7 @@ def _near_digits(heard: str, key: str) -> bool:
 
 def is_passphrase(text: str, cfg: dict) -> bool:
     """True if the configured admin key is heard, allowing misheard digits."""
-    key = re.sub(r"[^a-z0-9]", "", fold_text(str(cfg.get("admin_key") or "1515")))
+    key = re.sub(r"[^a-z0-9]", "", fold_text(str(cfg.get("admin_key") or "")))
     if not key:
         return False
     if key.isdigit():
@@ -2797,41 +2783,51 @@ def router_ask(instruction: str, schema: dict | None = None, timeout: float = 45
     return (answer or "").strip().splitlines()[0] if answer else ""
 
 
-def playback_card() -> str | None:
-    try:
-        text = open("/proc/asound/cards", encoding="utf-8").read()
-    except OSError:
+def _default_mixer() -> tuple[str, int, int] | None:
+    """Playback control on the OS default card: name, current value, maximum."""
+    result = subprocess.run(["amixer", "scontents"], capture_output=True, text=True)
+    if result.returncode != 0:
         return None
-    for line in text.splitlines():
-        if "wm8960" in line.lower():
-            match = re.search(r"\[([^\]]+)\]", line)
-            if match:
-                return match.group(1)
-    return None
+    preferred = ("Master", "PCM", "Speaker", "Headphone", "Playback")
+    found: dict[str, tuple[int, int]] = {}
+    for block in result.stdout.split("Simple mixer control "):
+        if "'" not in block or "Playback" not in block:
+            continue
+        name = block.split("'", 2)[1]
+        limit = re.search(r"Limits: Playback (\d+) - (\d+)", block)
+        level = re.search(r"Playback (\d+) \[", block)
+        if limit is None or level is None:
+            continue
+        found[name] = (int(level.group(1)), int(limit.group(2)))
+    for name in preferred:
+        if name in found:
+            current, maximum = found[name]
+            return name, current, maximum
+    if not found:
+        return None
+    name, (current, maximum) = next(iter(found.items()))
+    return name, current, maximum
 
 
 def current_playback() -> int | None:
-    card = playback_card()
-    if not card:
+    """Speaker volume as a percent of the OS default mixer."""
+    info = _default_mixer()
+    if info is None:
         return None
-    result = subprocess.run(
-        ["amixer", "-c", card, "sget", "Playback"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
+    _name, current, maximum = info
+    if maximum <= 0:
         return None
-    match = re.search(r"(?:Front Left|Mono):\s+(\d+)", result.stdout)
-    return int(match.group(1)) if match else None
+    return round(current * 100 / maximum)
 
 
-def set_playback(value: int) -> int | None:
-    card = playback_card()
-    if not card:
+def set_playback(percent: int) -> int | None:
+    info = _default_mixer()
+    if info is None:
         return None
-    value = max(0, min(255, int(value)))
+    name, _current, _maximum = info
+    percent = max(0, min(100, int(percent)))
     result = subprocess.run(
-        ["amixer", "-c", card, "sset", "Playback", str(value)],
+        ["amixer", "sset", name, f"{percent}%"],
         capture_output=True,
         text=True,
     )
@@ -2839,8 +2835,8 @@ def set_playback(value: int) -> int | None:
         log.warning("no pude fijar el volumen: %s", (result.stderr or "").strip())
         return None
     VOLUME_PATH.parent.mkdir(parents=True, exist_ok=True)
-    VOLUME_PATH.write_text(f"{value}\n", encoding="utf-8")
-    return value
+    VOLUME_PATH.write_text(f"{percent}\n", encoding="utf-8")
+    return percent
 
 
 def apply_saved_volume() -> None:
@@ -2848,6 +2844,8 @@ def apply_saved_volume() -> None:
         value = int(VOLUME_PATH.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return
+    if value > 100:
+        value = round(value * 100 / 255)
     set_playback(value)
 
 
@@ -2855,16 +2853,15 @@ def change_volume(direction: str) -> str:
     current = current_playback()
     if current is None:
         return "No pude cambiar el volumen."
-    step = 24
+    step = 8
     target = current + step if direction == "up" else current - step
-    target = max(0, min(255, target))
+    target = max(0, min(100, target))
     if target == current:
         return "El volumen ya está al máximo." if direction == "up" else "El volumen ya está al mínimo."
     if set_playback(target) is None:
         return "No pude cambiar el volumen."
-    percent = max(1, round(target * 100 / 255)) if target else 0
-    log.info("volumen %s -> %s (%s%%)", current, target, percent)
-    return f"Volumen al {percent} por ciento."
+    log.info("volumen %s -> %s", current, target)
+    return f"Volumen al {target} por ciento."
 
 
 def volume_command(text: str) -> str | None:
@@ -4343,16 +4340,14 @@ def make_beep() -> Path:
 def show_devices(cfg: dict) -> int:
     print("Playback in use:   ", resolve_playback(cfg))
     print("Playback setting:  ", cfg["playback_device"])
-    print("Headphone jack:    ", JACK)
-    print("HDMI0:             ", HDMI)
+    print("Capture in use:    ", resolve_capture(cfg) or "none")
     caps = list_capture_devices()
     if caps:
-        print("Microphones:")
+        print("Microphones the OS lists:")
         for device in caps:
             print("  ", device)
     else:
         print("Microphones: none")
-        print("The Pi jack cannot record. Use the WM8960 HAT or a USB microphone.")
     return 0
 
 
@@ -5673,16 +5668,11 @@ def run_loop(speech: Speech, cfg: dict) -> int:
             speaker = resolve_playback(cfg)
             if not device:
                 if not announced_missing:
-                    log.warning(
-                        "No microphone. The Pi headphone jack is speakers only. "
-                        "Seat the WM8960 HAT or plug in a USB microphone."
-                    )
+                    log.warning("No capture device. The operating system is not exposing a microphone.")
                     missing = (
-                        "No hay micrófono. Habla por el micrófono de la tarjeta de sonido."
+                        "No hay micrófono. El sistema no tiene una entrada de sonido."
                         if speech.language == "es"
-                        else "There is no microphone yet. The WM8960 sound card, "
-                        "or a USB microphone, is what I can listen with. "
-                        "The round jack on the Pi is only for speakers."
+                        else "There is no microphone. The operating system has no capture device."
                     )
                     speak(
                         speech,
@@ -5785,8 +5775,6 @@ def main(argv: list[str]) -> int:
     sub.add_parser("devices", help="show playback and microphone devices")
     test = sub.add_parser("self-test", help="check wake word, transcription, and Grok")
     test.add_argument("--no-grok", action="store_true", help="skip the live Grok call")
-    output = sub.add_parser("output", help="choose jack or hdmi and save it")
-    output.add_argument("target", choices=["jack", "hdmi"])
     args = parser.parse_args(argv)
     command = args.command or "run"
 
@@ -5800,12 +5788,6 @@ def main(argv: list[str]) -> int:
 
     if command == "devices":
         return show_devices(cfg)
-    if command == "output":
-        device = JACK if args.target == "jack" else HDMI
-        save_user_config({"playback_device": device})
-        print(f"Saved playback device {device}")
-        print("Restart the assistant: sudo systemctl restart grok-assistant")
-        return 0
 
     speech = load_speech(cfg)
     if command == "say":
