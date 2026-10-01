@@ -11,6 +11,7 @@ import argparse
 from collections import deque
 from datetime import datetime, timedelta, timezone
 import gzip
+import itertools
 import json
 import mmap
 import os
@@ -46,6 +47,7 @@ ROUTER_PATH = Path.home() / ".config" / "grok-assistant" / "router-session"
 VOICE_INDEX = Path.home() / ".config" / "grok-assistant" / "voice-index"
 VOLUME_PATH = Path.home() / ".config" / "grok-assistant" / "volume"
 SPEAKERS_PATH = Path.home() / ".config" / "grok-assistant" / "speakers.json"
+RAW_DIR = Path.home() / ".config" / "grok-assistant" / "raw"
 SPEAKER_MODEL = MODELS / "3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx"
 VOICE_SESSIONS = Path.home() / ".grok" / "sessions" / quote(str(ROOT), safe="")
 SHARED_NAME = "compartida"
@@ -90,7 +92,8 @@ SYSTEM_PROMPT_ES = (
     "COMANDO: pon cancion NOMBRE. COMANDO: pausa musica. COMANDO: seguir musica. "
     "COMANDO: para la musica. COMANDO: otro reconocedor. "
     "COMANDO: reconocedor kroko. COMANDO: reconocedor whisper. "
-    "COMANDO: reconocedor base. COMANDO: reconocedor canary. "
+    "COMANDO: reconocedor base. COMANDO: reconocedor small. COMANDO: reconocedor canary. "
+    "COMANDO: personalidad. COMANDO: personalidad vega. "
     "No pidas clave para esos."
 )
 
@@ -1725,15 +1728,20 @@ class Speech:
         self.asr_label = "Kroko"
         self.spanish = None
         self.offline = None
-        self._select_asr(self._saved_asr_id())
         self._load_spanish_voice(threads)
-        log.info("reconocedor: %s", self.asr_label)
+        saved = self._normalize_asr_id(self._saved_asr_id())
+        try:
+            score_missing_engines(self)
+        except Exception:
+            log.exception("no pude puntuar los motores")
+        self._select_asr(choose_live_asr(saved))
+        log_listen_motor(self)
 
     def _load_spanish_voice(self, threads: int) -> None:
         self.voice_specs = [
             (ES_TTS_DIR, "Dave, España", 0),
-            (MODELS / "vits-piper-es_ES-sharvard-medium-int8", "Sharvard primera, España", 0),
-            (MODELS / "vits-piper-es_ES-sharvard-medium-int8", "Sharvard segunda, España", 1),
+            (MODELS / "vits-piper-es_ES-sharvard-medium-int8", "Sharvard, España, hablante 0", 0),
+            (MODELS / "vits-piper-es_ES-sharvard-medium-int8", "Sharvard, España, hablante 1", 1),
             (MODELS / "vits-piper-es_ES-carlfm-x_low-int8", "Carlfm, España", 0),
             (MODELS / "vits-piper-es_ES-glados-medium-int8", "Glados, España", 0),
             (MODELS / "vits-piper-es_ES-miro-high-int8", "Miro, España", 0),
@@ -1830,21 +1838,27 @@ class Speech:
         except OSError:
             return "kroko"
 
+    def _normalize_asr_id(self, asr_id: str) -> str:
+        return {"whisper-tiny": "whisper", "whisper-base": "base"}.get(asr_id or "", asr_id or "kroko")
+
     def _save_asr_id(self, asr_id: str) -> None:
         path = Path.home() / ".config" / "grok-assistant" / "asr-index"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(asr_id + "\n", encoding="utf-8")
 
-    def _select_asr(self, asr_id: str) -> str:
-        choices = available_asrs()
-        chosen = next((item for item in choices if item["id"] == asr_id), None)
-        if chosen is None:
-            chosen = choices[0]
+    def _release_asr(self) -> None:
         import gc
 
         self.spanish = None
         self.offline = None
         gc.collect()
+
+    def _select_asr(self, asr_id: str) -> str:
+        choices = available_asrs()
+        chosen = next((item for item in choices if item["id"] == asr_id), None)
+        if chosen is None:
+            chosen = next((item for item in choices if item["id"] == "kroko"), choices[0])
+        self._release_asr()
         try:
             self._open_asr(chosen)
         except Exception:
@@ -1858,6 +1872,14 @@ class Speech:
         self._save_asr_id(chosen["id"])
         log.info("reconocedor activo: %s", self.asr_label)
         return self.asr_label
+
+    def _load_chosen(self, chosen: dict) -> None:
+        """Open one engine for scoring. Does not write asr-index."""
+        self._release_asr()
+        self._open_asr(chosen)
+        self.asr_kind = chosen["kind"]
+        self.asr_id = chosen["id"]
+        self.asr_label = chosen["label"]
 
     def _open_asr(self, chosen: dict) -> None:
         kind = chosen["kind"]
@@ -1876,7 +1898,6 @@ class Speech:
                 max_active_paths=8,
                 hotwords_file=str(hotwords),
                 hotwords_score=3.0,
-                model_type="zipformer2",
                 provider="cpu",
                 enable_endpoint_detection=True,
                 rule2_min_trailing_silence=0.8,
@@ -1996,6 +2017,36 @@ class Speech:
         self.asr.decode_stream(stream)
         return (stream.result.text or "").strip()
 
+    def transcribe_wav(self, path: Path) -> str:
+        """Read one enrollment wav with the engine that is loaded now."""
+        with wave.open(str(path), "rb") as handle:
+            rate = handle.getframerate()
+            channels = handle.getnchannels()
+            frames = handle.readframes(handle.getnframes())
+        if not frames:
+            return ""
+        pcm = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+        if channels > 1:
+            pcm = pcm.reshape(-1, channels).mean(axis=1)
+        if rate != RATE:
+            pcm = resample(pcm, rate, RATE)
+        if pcm.size == 0:
+            return ""
+        if self.asr_kind == "streaming" and self.spanish is not None:
+            stream = self.spanish.create_stream()
+            stream.accept_waveform(RATE, pcm)
+            stream.accept_waveform(RATE, np.zeros(int(0.4 * RATE), dtype=np.float32))
+            stream.input_finished()
+            while self.spanish.is_ready(stream):
+                self.spanish.decode_stream(stream)
+            return (self.spanish.get_result(stream) or "").strip()
+        if self.offline is None:
+            return ""
+        off = self.offline.create_stream()
+        off.accept_waveform(RATE, pcm)
+        self.offline.decode_stream(off)
+        return (off.result.text or "").strip()
+
     def synthesize(self, text: str) -> tuple[np.ndarray, int]:
         sid = getattr(self, "voice_sid", 0)
         engine = self.tts
@@ -2021,23 +2072,30 @@ def speakable(text: str) -> str:
     return cleaned
 
 
-def available_asrs() -> list[dict]:
-    """Recognizers that are actually on disk and can be tried."""
-    catalog = [
+def asr_catalog() -> list[dict]:
+    """Fixed local engines. Audio stays on the Pi. small is never auto-selected."""
+    return [
         {"id": "kroko", "label": "Kroko", "kind": "streaming"},
         {
-            "id": "whisper-tiny",
+            "id": "whisper",
             "label": "Whisper pequeño",
             "kind": "whisper",
             "dir": MODELS / "sherpa-onnx-whisper-tiny",
             "prefix": "tiny",
         },
         {
-            "id": "whisper-base",
+            "id": "base",
             "label": "Whisper base",
             "kind": "whisper",
             "dir": MODELS / "sherpa-onnx-whisper-base",
             "prefix": "base",
+        },
+        {
+            "id": "small",
+            "label": "Whisper small",
+            "kind": "whisper",
+            "dir": MODELS / "sherpa-onnx-whisper-small",
+            "prefix": "small",
         },
         {
             "id": "canary",
@@ -2046,8 +2104,12 @@ def available_asrs() -> list[dict]:
             "dir": MODELS / "sherpa-onnx-nemo-canary-180m-flash-en-es-de-fr-int8",
         },
     ]
+
+
+def available_asrs() -> list[dict]:
+    """Recognizers that are actually on disk and can be tried."""
     ready = []
-    for spec in catalog:
+    for spec in asr_catalog():
         if spec["kind"] == "streaming":
             ready.append(spec)
             continue
@@ -2080,19 +2142,21 @@ def asr_choice(text: str) -> str | None:
     if not folded or "reconoce" not in folded or len(folded.split()) > 10:
         return None
     named = (
-        ("whisper base", "whisper-base"),
-        ("whisper pequeno", "whisper-tiny"),
-        ("whisper pequenyo", "whisper-tiny"),
-        ("whisper tiny", "whisper-tiny"),
-        ("whisper", "whisper-tiny"),
-        ("wisper", "whisper-tiny"),
-        ("uisper", "whisper-tiny"),
-        ("visper", "whisper-tiny"),
-        ("guisper", "whisper-tiny"),
-        ("pequeno", "whisper-tiny"),
-        ("pequenyo", "whisper-tiny"),
-        ("tiny", "whisper-tiny"),
-        ("base", "whisper-base"),
+        ("whisper small", "small"),
+        ("whisper base", "base"),
+        ("whisper pequeno", "whisper"),
+        ("whisper pequenyo", "whisper"),
+        ("whisper tiny", "whisper"),
+        ("small", "small"),
+        ("whisper", "whisper"),
+        ("wisper", "whisper"),
+        ("uisper", "whisper"),
+        ("visper", "whisper"),
+        ("guisper", "whisper"),
+        ("pequeno", "whisper"),
+        ("pequenyo", "whisper"),
+        ("tiny", "whisper"),
+        ("base", "base"),
         ("canario", "canary"),
         ("canari", "canary"),
         ("canary", "canary"),
@@ -2105,6 +2169,151 @@ def asr_choice(text: str) -> str | None:
     if re.search(r"\b(otro|siguiente|cambia|cambiar)\b", folded):
         return "next"
     return None
+
+
+def _edit_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    prev = list(range(len(right) + 1))
+    for i, ca in enumerate(left, 1):
+        cur = [i]
+        row_min = i
+        for j, cb in enumerate(right, 1):
+            value = min(cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + (ca != cb))
+            cur.append(value)
+            if value < row_min:
+                row_min = value
+        if row_min > 1 and abs(len(left) - len(right)) > 1:
+            return row_min
+        prev = cur
+    return prev[-1]
+
+
+def phrase_hit(expected: str, heard: str) -> bool:
+    """True when the heard phrase matches the stored one.
+
+    Three words or fewer must all appear, in order. Four or more may miss one.
+    One inserted, deleted, or changed character still counts. Extra words may be skipped.
+    """
+    exp = _folded_words(expected).split()
+    got = _folded_words(heard).split()
+    if not exp:
+        return False
+    allow = 1 if len(exp) >= 4 else 0
+    n, m = len(exp), len(got)
+    missing = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(1, n + 1):
+        missing[i][0] = i
+        for j in range(1, m + 1):
+            best = missing[i][j - 1]
+            best = min(best, missing[i - 1][j] + 1)
+            if _edit_distance(exp[i - 1], got[j - 1]) <= 1:
+                best = min(best, missing[i - 1][j - 1])
+            missing[i][j] = best
+    return missing[n][m] <= allow
+
+
+def combined_percentages() -> dict[str, int]:
+    """One percentage per engine: hits of every person over totals, rounded."""
+    hits: dict[str, int] = {}
+    totals: dict[str, int] = {}
+    for person in speakers().people:
+        scores = person.get("scores") or {}
+        if not isinstance(scores, dict):
+            continue
+        for engine_id, row in scores.items():
+            if not isinstance(row, dict):
+                continue
+            total = int(row.get("total") or 0)
+            if total <= 0:
+                continue
+            hits[engine_id] = hits.get(engine_id, 0) + int(row.get("hits") or 0)
+            totals[engine_id] = totals.get(engine_id, 0) + total
+    return {engine_id: int(round(100.0 * hits[engine_id] / totals[engine_id])) for engine_id in totals}
+
+
+def choose_live_asr(saved_id: str) -> str:
+    """Highest combined score among installed engines, except Whisper small.
+
+    A tie keeps the engine already in use. No scores means Kroko.
+    """
+    ready = [item["id"] for item in available_asrs()]
+    eligible = [engine_id for engine_id in ready if engine_id != "small"] or ready
+    perc = combined_percentages()
+    ranked = [(engine_id, perc[engine_id]) for engine_id in eligible if engine_id in perc]
+    if not ranked:
+        return "kroko" if "kroko" in ready else eligible[0]
+    best = max(score for _, score in ranked)
+    tied = [engine_id for engine_id, score in ranked if score == best]
+    if saved_id in tied:
+        return saved_id
+    return tied[0]
+
+
+def log_listen_motor(speech: Speech) -> None:
+    perc = combined_percentages()
+    if not perc:
+        log.info("motor escucha: Kroko. huellas combinadas: aún no hay porcentajes.")
+        return
+    score = perc.get(speech.asr_id)
+    if score is None:
+        log.info("motor escucha: %s. huellas combinadas.", speech.asr_label)
+        return
+    log.info("motor escucha: %s (%s%%). huellas combinadas.", speech.asr_label, score)
+
+
+def score_missing_engines(speech: Speech) -> None:
+    """Transcribe saved wavs with each installed engine that has no score yet.
+
+    One model at a time, so a small Pi is not asked to hold every engine.
+    """
+    book = speakers()
+    if not any(person.get("raw") for person in book.people):
+        return
+    installed = {item["id"]: item for item in available_asrs()}
+    for spec in asr_catalog():
+        chosen = installed.get(spec["id"])
+        if chosen is None:
+            continue
+        pending = []
+        for person in book.people:
+            raw = person.get("raw") or []
+            if not raw:
+                continue
+            scores = person.get("scores") if isinstance(person.get("scores"), dict) else {}
+            if spec["id"] not in scores:
+                pending.append(person)
+        if not pending:
+            continue
+        log.info("puntuando %s", spec["label"])
+        try:
+            speech._load_chosen(chosen)
+        except Exception:
+            log.exception("no puntúo %s", spec["id"])
+            speech._release_asr()
+            continue
+        for person in pending:
+            hits = 0
+            total = 0
+            for item in person.get("raw") or []:
+                if not isinstance(item, dict):
+                    continue
+                path = RAW_DIR / str(item.get("file") or "")
+                if not path.is_file():
+                    continue
+                total += 1
+                heard = speech.transcribe_wav(path)
+                if phrase_hit(str(item.get("phrase") or ""), heard):
+                    hits += 1
+                log.info("puntuación %s «%s»: %s", spec["id"], item.get("phrase") or "", heard)
+            person.setdefault("scores", {})
+            person["scores"][spec["id"]] = {"hits": hits, "total": total}
+        book._save()
+        speech._release_asr()
 
 
 def _hello_lines(language: str) -> tuple[str, ...]:
@@ -2568,6 +2777,15 @@ def canonicalize(phrase: str, pending: str) -> str:
         "voz <numero>\n"
         "subir volumen\n"
         "bajar volumen\n"
+        "otro reconocedor\n"
+        "reconocedor kroko\n"
+        "reconocedor whisper\n"
+        "reconocedor base\n"
+        "reconocedor small\n"
+        "reconocedor canary\n"
+        "personalidad\n"
+        "personalidad <nombre>\n"
+        "identifica mi voz\n"
         "listar sesiones\n"
         "cerrar sesion\n"
         "ok gracias\n"
@@ -2590,6 +2808,12 @@ def canonicalize(phrase: str, pending: str) -> str:
         "siguiente voz, otra voz, cambia a la siguiente -> otra voz. "
         "más alto, sube el volumen, sube el sonido -> subir volumen. "
         "más bajo, baja el volumen, baja el sonido -> bajar volumen. "
+        "otro reconocedor, siguiente reconocedor -> otro reconocedor. "
+        "reconocedor whisper small -> reconocedor small. "
+        "reconocedor whisper pequeño -> reconocedor whisper. "
+        "pon la personalidad vega, personalidad vega -> personalidad vega. "
+        "qué personalidad tienes -> personalidad. "
+        "identifica mi voz, graba mi voz -> identifica mi voz. "
         "explícame los comandos, qué puedo decir, pon ejemplos -> ayuda. "
         "quiero una sesión que se llame casa de campo -> crear sesion casa de campo.\n"
         "Si es una pregunta o un encargo normal, responde exactamente PREGUNTA.\n"
@@ -2627,7 +2851,8 @@ INTERPRET_SYSTEM = (
     "comando: quiere una acción. orden es una sola de estas, texto vacío: "
     "subir volumen, bajar volumen, otra voz, voz N, pon cancion TITULO, "
     "pausa musica, seguir musica, para la musica, otro reconocedor, "
-    "reconocedor kroko, reconocedor whisper, reconocedor base, reconocedor canary, "
+    "reconocedor kroko, reconocedor whisper, reconocedor base, reconocedor small, reconocedor canary, "
+    "personalidad, personalidad NOMBRE, identifica mi voz, "
     "listar sesiones, crear sesion NOMBRE, abrir sesion NOMBRE, cerrar sesion, "
     "borrar sesion NOMBRE, listar agentes, abrir agente NOMBRE, crear agente NOMBRE, "
     "cerrar agente, apagar, ayuda, prueba. "
@@ -3011,12 +3236,13 @@ def help_lines() -> list[tuple[str, str]]:
         ("bajar volumen", "más bajo"),
         ("voz NÚMERO", "esa voz, por ejemplo la 4"),
         ("otra voz", "pasa a la siguiente"),
-        ("otro reconocedor", "Kroko, Whisper o Canary"),
+        ("otro reconocedor", "Kroko, Whisper, base, small o Canary"),
+        ("personalidad", "alex, vega, nico…"),
         ("pon la canción X", "suena solo el audio"),
         ("para la música", "corta la canción"),
         ("apaga el dispositivo", "pide sí y lo apaga"),
         ("prueba", "escribe lo que oye; salir"),
-        ("identifica mi voz", "guarda varias huellas"),
+        ("identifica mi voz", "16 frases, una vez"),
     ]
 
 
@@ -3027,7 +3253,9 @@ def help_speech() -> str:
         "Comando otra voz. Comando subir volumen. Comando pon la canción y el título. "
         "Comando apaga el dispositivo, y si dices sí, se apaga. "
         "Comando modo administrador, y después la clave, solo para tareas del sistema. "
-        "Comando identifica mi voz guarda varias huellas de la misma persona."
+        "Comando otro reconocedor cambia entre Kroko, Whisper, base, small y Canary. "
+        "Comando personalidad elige una de las ocho. "
+        "Comando identifica mi voz graba dieciséis frases, una sola vez."
     )
 
 
@@ -3201,8 +3429,24 @@ def music_command(text: str) -> tuple[str, str] | None:
     return None
 
 
-ENROLL_LINES = ("hola grok", "estás ahí", "qué hora es", "pon una canción")
-ENROLL_TAKES = 3
+ENROLL_LINES = (
+    "hola grok",
+    "estás ahí",
+    "qué hora es",
+    "pon una canción",
+    "sube el volumen",
+    "baja el volumen",
+    "para la música",
+    "buenos días",
+    "hasta luego",
+    "qué día es hoy",
+    "me escuchas",
+    "gracias",
+    "abre la sesión",
+    "cuenta hasta tres",
+    "cómo estás",
+    "dime la hora",
+)
 
 
 def people_command(text: str) -> tuple[str, str] | None:
@@ -3288,9 +3532,43 @@ def _enroll_take(
     return final, np.concatenate(chunks) if chunks else None
 
 
-def _name_is_saved(name: str) -> bool:
+def _enroll_stopped(text: str) -> bool:
+    return is_leave_test(text) or _folded_words(text) in {"salir", "cancela", "cancelar"}
+
+
+def _saved_name(name: str) -> str:
     wanted = fold_text(name)
-    return any(fold_text(str(person.get("name") or "")) == wanted for person in speakers().people)
+    for person in speakers().people:
+        saved = str(person.get("name") or "")
+        if fold_text(saved) == wanted:
+            return saved
+    return ""
+
+
+def _cosine(one: np.ndarray, other: np.ndarray) -> float:
+    vector = np.asarray(one, dtype=np.float32)
+    sample = np.asarray(other, dtype=np.float32)
+    return float(np.dot(vector, sample) / (np.linalg.norm(vector) * np.linalg.norm(sample) + 1e-8))
+
+
+def largest_voice_group(vectors: list[np.ndarray]) -> list[int]:
+    """Indexes of the largest set where every pair has cosine >= 0.55.
+
+    Needs at least 12. The first group of that size is kept.
+    """
+    count = len(vectors)
+    if count < 12:
+        return []
+    for size in range(count, 11, -1):
+        for combo in itertools.combinations(range(count), size):
+            if all(_cosine(vectors[i], vectors[j]) >= 0.55 for i, j in itertools.combinations(combo, 2)):
+                return list(combo)
+    return []
+
+
+def name_slug(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", fold_text(name)).strip("-")
+    return slug or "persona"
 
 
 def _enroll_choose_name(
@@ -3302,68 +3580,57 @@ def _enroll_choose_name(
     speaker: str,
     speaker_embedding: np.ndarray | None,
 ) -> str:
-    """Ask who this is. The same saved name is redone. A new name is a new person."""
+    """Ask the name. A saved voice or a saved name is replaced. A new name is another person."""
     candidate = ""
-    if speaker_embedding is not None:
-        known, _index = speakers().match(speaker_embedding)
-        if known:
-            speak(
-                speech,
-                f"Esta voz ya está guardada como {known}. "
-                "¿Repito la identificación de la misma persona? Di sí, o di otro nombre.",
-                speaker,
-            )
-            _drain_mic(mic)
-            answer, _audio = _enroll_take(speech, mic, floor, cfg, display, "sí, o di otro nombre")
-            if is_leave_test(answer) or _folded_words(answer) in {"salir", "cancela", "cancelar"}:
-                return ""
-            if confirms(answer) is True:
-                return known
-            if confirms(answer) is not False:
-                other = person_name(answer)
-                if other and fold_text(other) != fold_text(known):
-                    candidate = other
-    for _attempt in range(3):
+    name_embedding = None
+    ask_name = True
+    for _attempt in range(4):
         if not candidate:
-            speak(speech, "Di tu nombre.", speaker)
+            speak(speech, "¿Cómo te llamas?" if ask_name else "Di otro nombre.", speaker)
+            ask_name = False
             _drain_mic(mic)
-            heard, _audio = _enroll_take(speech, mic, floor, cfg, display, "di tu nombre")
-            if is_leave_test(heard) or _folded_words(heard) in {"salir", "cancela", "cancelar"}:
+            heard, audio = _enroll_take(speech, mic, floor, cfg, display, "cómo te llamas")
+            if _enroll_stopped(heard):
                 return ""
             candidate = person_name(heard)
             if not candidate:
                 speak(speech, "No he oído el nombre.", speaker)
                 continue
-        if _name_is_saved(candidate):
-            speak(
-                speech,
-                f"He oído {candidate}. Ya está guardado. Es la misma persona. "
-                "¿Repito su identificación? Di sí o no.",
-                speaker,
-            )
+            captured = speakers().capture(audio)
+            name_embedding = captured[0] if captured is not None else None
+        voice_name = ""
+        for emb in (name_embedding, speaker_embedding):
+            if emb is None:
+                continue
+            known, _index = speakers().match(emb)
+            if known:
+                voice_name = known
+                break
+        saved = _saved_name(candidate)
+        if voice_name or saved:
+            nombre = voice_name or saved
+            speak(speech, f"Esta voz ya la tengo como {nombre}. ¿Repito la identificación?", speaker)
         else:
-            speak(
-                speech,
-                f"He oído {candidate}. No está guardado. "
-                "¿Lo guardo como otra persona? Di sí o no.",
-                speaker,
-            )
+            nombre = ""
+            speak(speech, f"No tengo a {candidate}. ¿Lo guardo como otra persona?", speaker)
         _drain_mic(mic)
-        answer, _audio = _enroll_take(speech, mic, floor, cfg, display, "sí o no")
-        if is_leave_test(answer) or _folded_words(answer) in {"salir", "cancela", "cancelar"}:
+        answer, answer_audio = _enroll_take(speech, mic, floor, cfg, display, "sí o no")
+        if _enroll_stopped(answer):
             return ""
         if confirms(answer) is True:
-            return candidate
+            return nombre or candidate
         if confirms(answer) is False:
-            speak(speech, "De acuerdo. Di otro nombre.", speaker)
             candidate = ""
+            name_embedding = None
             continue
         other = person_name(answer)
         if other:
             candidate = other
+            captured = speakers().capture(answer_audio)
+            if captured is not None:
+                name_embedding = captured[0]
             continue
-        speak(speech, "Di sí, no, u otro nombre.", speaker)
-        candidate = ""
+        speak(speech, "Di sí o no.", speaker)
     return ""
 
 
@@ -3376,37 +3643,65 @@ def run_voice_enrollment(
     speaker: str,
     speaker_embedding: np.ndarray | None = None,
 ) -> None:
-    """Several prompted takes of one person, stored as separate voice prints."""
-    if speakers().extractor is None:
+    """Sixteen phrases, once. One CampPlus print, then a score for each installed engine."""
+    book = speakers()
+    if book.extractor is None:
         speak(speech, "No tengo el modelo de voces.", speaker)
         return
-    speak(speech, "Vamos a guardar tu voz. Primero el nombre. Di salir para cancelar.", speaker)
-    _drain_mic(mic)
     name = _enroll_choose_name(speech, mic, floor, cfg, display, speaker, speaker_embedding)
     if not name:
         speak(speech, "Cancelo la identificación.", speaker)
         return
-    taken: list[np.ndarray] = []
-    for prompt in ENROLL_LINES:
-        for turn in range(ENROLL_TAKES):
-            spoken = prompt if turn == 0 else f"Otra vez. {prompt}"
-            speak(speech, spoken, speaker)
-            _drain_mic(mic)
-            heard, audio = _enroll_take(speech, mic, floor, cfg, display, prompt)
-            if is_leave_test(heard) or _folded_words(heard) in {"salir", "cancela", "cancelar"}:
-                speak(speech, "Cancelo la identificación.", speaker)
+    taken: list[tuple[str, np.ndarray, np.ndarray]] = []
+    empty_run = 0
+    total = len(ENROLL_LINES)
+    for index, prompt in enumerate(ENROLL_LINES, start=1):
+        if index == 1:
+            spoken = (
+                f"Grabaré {total} frases una sola vez. El sonido vale para todos los motores. "
+                f"1 de {total}. {prompt}"
+            )
+        else:
+            spoken = f"{index} de {total}. {prompt}"
+        speak(speech, spoken, speaker)
+        _drain_mic(mic)
+        heard, audio = _enroll_take(speech, mic, floor, cfg, display, prompt)
+        if _enroll_stopped(heard):
+            speak(speech, "Cancelo la identificación.", speaker)
+            return
+        captured = book.capture(audio)
+        if captured is None:
+            empty_run += 1
+            log.info("toma vacía %d", index)
+            if empty_run >= 3:
+                speak(speech, "No oigo el micrófono. Lo dejo.", speaker)
                 return
-            fresh = speakers().embed(audio)
-            if fresh is not None:
-                taken.append(fresh)
-                log.info("toma de voz %d OI: %s", len(taken), heard)
-            time.sleep(0.2)
-    if len(taken) < 3:
-        speak(speech, "No he cogido bastante voz. Prueba otra vez.", speaker)
+            continue
+        empty_run = 0
+        vector, wave_audio = captured
+        taken.append((prompt, wave_audio, vector))
+        log.info("toma de voz %d OI: %s", len(taken), heard)
+    group = largest_voice_group([item[2] for item in taken])
+    if len(group) < 12:
+        speak(speech, "Estas tomas no son una sola voz. No guardo a otra persona.", speaker)
         return
-    speakers().add_prints(name, taken, replace=True)
-    speakers().set_lock(name)
-    speak(speech, f"Guardé {len(taken)} huellas de {name}. A partir de ahora solo te escucho a ti.", speaker)
+    kept = [taken[index] for index in group]
+    book.save_enrollment(name, kept)
+    speak(
+        speech,
+        f"Listo, {name}. El sonido queda guardado y vale para todos los motores. Valoro cada uno.",
+        speaker,
+    )
+    if len(kept) < total:
+        speak(speech, f"Guardo {len(kept)} de {total}.", speaker)
+    try:
+        score_missing_engines(speech)
+        speech._select_asr(choose_live_asr(speech.asr_id))
+        log_listen_motor(speech)
+    except Exception:
+        log.exception("no pude puntuar tras identificar")
+        if speech.spanish is None and speech.offline is None:
+            speech._select_asr("kroko")
 
 
 def is_shutdown(text: str) -> bool:
@@ -3469,7 +3764,7 @@ def person_name(text: str) -> str:
 
 
 class SpeakerBook:
-    """Local voice prints. Each person is a name plus one embedding. Nothing leaves the Pi."""
+    """Local CampPlus prints. One print works for every listening engine. Nothing leaves the Pi."""
 
     def __init__(self) -> None:
         self.people: list[dict] = []
@@ -3491,24 +3786,76 @@ class SpeakerBook:
         else:
             log.info("sin modelo de voces; no identifico personas")
 
+    def _normalize_person(self, item: dict, name: str) -> dict:
+        """Old list-of-vectors stays as prints.legacy. Loading does not write the file."""
+        prints = item.get("prints")
+        store: dict = {}
+        if isinstance(prints, dict):
+            store = prints
+        elif isinstance(prints, list) and prints:
+            store = {"legacy": prints}
+        elif isinstance(item.get("embedding"), list) and item.get("embedding"):
+            store = {"legacy": [item["embedding"]]}
+        last = item.get("last", 0)
+        if isinstance(last, bool) or not isinstance(last, (int, float)):
+            last = 0
+        seen = parse_iso(str(item.get("last_seen") or ""))
+        if seen is not None:
+            last = seen.timestamp()
+        raw = item.get("raw") if isinstance(item.get("raw"), list) else []
+        scores = item.get("scores") if isinstance(item.get("scores"), dict) else {}
+        return {
+            "name": name,
+            "prints": store,
+            "raw": raw,
+            "scores": scores,
+            "last": float(last or 0),
+            "greet_count": int(item.get("greet_count") or 0),
+        }
+
     def _load(self) -> None:
         try:
             data = json.loads(SPEAKERS_PATH.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return
-        people = data.get("people") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return
+        people = data.get("people")
+        loaded: list[dict] = []
         if isinstance(people, list):
-            self.people = [item for item in people if item.get("name") and item.get("embedding")]
-        own = data.get("self") if isinstance(data, dict) else None
+            for item in people:
+                if not isinstance(item, dict) or not item.get("name"):
+                    continue
+                if not (item.get("embedding") or item.get("prints")):
+                    continue
+                loaded.append(self._normalize_person(item, str(item["name"])))
+        elif isinstance(people, dict):
+            for name, item in people.items():
+                if isinstance(item, dict) and name:
+                    loaded.append(self._normalize_person(item, str(name)))
+        self.people = loaded
+        own = data.get("self")
         if isinstance(own, list) and own:
             self.self_embedding = np.asarray(own, dtype=np.float32)
-        locked = data.get("locked") if isinstance(data, dict) else None
+        locked = data.get("locked")
         if isinstance(locked, str):
             self.locked = locked
 
     def _save(self) -> None:
         SPEAKERS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        payload: dict = {"people": self.people}
+        people: dict = {}
+        for person in self.people:
+            name = str(person.get("name") or "")
+            if not name:
+                continue
+            people[name] = {
+                "prints": person.get("prints") if isinstance(person.get("prints"), dict) else {},
+                "raw": person.get("raw") if isinstance(person.get("raw"), list) else [],
+                "scores": person.get("scores") if isinstance(person.get("scores"), dict) else {},
+                "last": person.get("last") or 0,
+                "greet_count": int(person.get("greet_count") or 0),
+            }
+        payload: dict = {"people": people}
         if self.locked:
             payload["locked"] = self.locked
         if self.self_embedding is not None:
@@ -3574,16 +3921,46 @@ class SpeakerBook:
             return None
         return self._embed_wave(audio)
 
-    def _prints(self, person: dict) -> list[np.ndarray]:
+    def capture(self, samples: np.ndarray | None) -> tuple[np.ndarray, np.ndarray] | None:
+        """CampPlus vector plus the 16 kHz float audio, or nothing if the take is empty."""
+        audio = self._wave(samples if samples is not None else np.array([]), RATE)
+        if audio is None:
+            return None
+        fresh = self._embed_wave(audio)
+        if fresh is None:
+            return None
+        return fresh, audio
+
+    def _vector_list(self, raw: object) -> list[np.ndarray]:
         vectors: list[np.ndarray] = []
+        if not isinstance(raw, list):
+            return vectors
+        for item in raw:
+            if isinstance(item, list) and item:
+                vectors.append(np.asarray(item, dtype=np.float32))
+        return vectors
+
+    def _prints(self, person: dict) -> list[np.ndarray]:
         raw = person.get("prints")
-        if isinstance(raw, list):
-            for item in raw:
-                if isinstance(item, list) and item:
-                    vectors.append(np.asarray(item, dtype=np.float32))
+        if isinstance(raw, dict):
+            camp = self._vector_list(raw.get("campplus"))
+            if camp:
+                return camp
+            vectors: list[np.ndarray] = []
+            for value in raw.values():
+                vectors.extend(self._vector_list(value))
+            return vectors
+        vectors = self._vector_list(raw)
         if not vectors and person.get("embedding"):
             vectors.append(np.asarray(person["embedding"], dtype=np.float32))
         return vectors
+
+    def gate(self, person: dict) -> float:
+        """CampPlus uses 0.55. A print from before that change stays at 0.30."""
+        prints = person.get("prints")
+        if isinstance(prints, dict) and self._vector_list(prints.get("campplus")):
+            return 0.55
+        return 0.30
 
     def best_score(self, embedding: np.ndarray, person: dict) -> float:
         best = 0.0
@@ -3595,24 +3972,34 @@ class SpeakerBook:
         return best
 
     def match(self, embedding: np.ndarray) -> tuple[str, int]:
+        """Closest name that clears that person's own threshold."""
         best_name = ""
         best = 0.0
-        best_index = -1
+        passed_name = ""
+        passed = 0.0
+        passed_index = -1
         vector = np.asarray(embedding, dtype=np.float32)
         for index, person in enumerate(self.people):
             score = self.best_score(vector, person)
             if score > best:
                 best = score
                 best_name = str(person["name"])
-                best_index = index
+            if score >= self.gate(person) and score > passed:
+                passed = score
+                passed_name = str(person["name"])
+                passed_index = index
         log.info("voz parecida: %s %.2f", best_name or "(nadie)", best)
-        if best >= 0.45 and best_name:
-            return best_name, best_index
-        return "", -1
+        if passed_index < 0:
+            return "", -1
+        return passed_name, passed_index
 
     def since(self, index: int) -> timedelta | None:
         if index < 0 or index >= len(self.people):
             return None
+        last = self.people[index].get("last")
+        if isinstance(last, (int, float)) and not isinstance(last, bool) and float(last) > 0:
+            when = datetime.fromtimestamp(float(last), timezone.utc)
+            return now_utc() - when
         when = parse_iso(str(self.people[index].get("last_seen") or ""))
         if when is None:
             return None
@@ -3621,7 +4008,7 @@ class SpeakerBook:
     def mark(self, index: int) -> None:
         if index < 0 or index >= len(self.people):
             return
-        self.people[index]["last_seen"] = iso_now()
+        self.people[index]["last"] = time.time()
         self._save()
 
     def next_extra(self, index: int) -> str:
@@ -3641,51 +4028,99 @@ class SpeakerBook:
     def add(self, name: str, embedding: np.ndarray) -> int:
         return self.add_prints(name, [embedding])
 
-    def add_prints(self, name: str, embeddings: list[np.ndarray], replace: bool = False) -> int:
-        """Keep up to 12 takes of one person. The same name is the same person.
-
-        A two-word name such as Jose Antonio is one person. Re-enrolling that
-        name replaces the old prints instead of creating another person.
-        """
+    def _index_of(self, name: str) -> int:
         wanted = fold_text(name)
-        index = next(
+        return next(
             (i for i, person in enumerate(self.people) if fold_text(str(person.get("name") or "")) == wanted),
             -1,
         )
+
+    def _person_slug(self, person: dict) -> str:
+        raw = person.get("raw") or []
+        if raw and isinstance(raw[0], dict) and "/" in str(raw[0].get("file") or ""):
+            return str(raw[0]["file"]).split("/", 1)[0]
+        return ""
+
+    def _free_slug(self, name: str) -> str:
+        used = {self._person_slug(person) for person in self.people}
+        used.discard("")
+        candidate = name_slug(name)
+        number = 2
+        while candidate in used or (RAW_DIR / candidate).exists():
+            candidate = f"{name_slug(name)}-{number}"
+            number += 1
+        return candidate
+
+    def _drop_raw(self, person: dict) -> None:
+        slug = self._person_slug(person)
+        if slug:
+            shutil.rmtree(RAW_DIR / slug, ignore_errors=True)
+
+    def save_enrollment(self, name: str, takes: list[tuple[str, np.ndarray, np.ndarray]]) -> int:
+        """Keep one voice group. Raw wavs sit beside speakers.json. Scores start empty."""
+        index = self._index_of(name)
+        if index < 0:
+            person = {"name": name, "prints": {}, "raw": [], "scores": {}, "last": 0, "greet_count": 0}
+            self.people.append(person)
+            index = len(self.people) - 1
+            slug = self._free_slug(name)
+            log.info("persona nueva: %s", name)
+        else:
+            person = self.people[index]
+            name = str(person.get("name") or name)
+            slug = self._person_slug(person) or self._free_slug(name)
+            self._drop_raw(person)
+            log.info("reidentifico: %s", name)
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
+        os.chmod(RAW_DIR, 0o700)
+        folder = RAW_DIR / slug
+        folder.mkdir(parents=True, exist_ok=True)
+        os.chmod(folder, 0o700)
+        raw = []
+        packed = []
+        for number, (phrase, audio, vector) in enumerate(takes):
+            rel = f"{slug}/{number:02d}.wav"
+            write_wav(RAW_DIR / rel, audio, RATE)
+            os.chmod(RAW_DIR / rel, 0o600)
+            raw.append({"phrase": phrase, "file": rel})
+            packed.append([round(float(value), 5) for value in vector])
+        person["name"] = name
+        person["prints"] = {"campplus": packed}
+        person["raw"] = raw
+        person["scores"] = {}
+        self.locked = name
+        self._save()
+        log.info("huellas de %s: %d", name, len(packed))
+        return index
+
+    def add_prints(self, name: str, embeddings: list[np.ndarray], replace: bool = False) -> int:
+        """Store CampPlus vectors when a caller has no wavs. Enrollment uses save_enrollment."""
+        index = self._index_of(name)
         if index < 0:
             self.people.append(
-                {
-                    "name": name,
-                    "embedding": [],
-                    "prints": [],
-                    "last_seen": iso_now(),
-                    "greet_count": 0,
-                }
+                {"name": name, "prints": {}, "raw": [], "scores": {}, "last": time.time(), "greet_count": 0}
             )
             index = len(self.people) - 1
-            log.info("persona nueva: %s", name)
-        elif replace:
-            log.info("reidentifico: %s", self.people[index]["name"])
         person = self.people[index]
-        stored = [] if replace else self._prints(person)
+        prints = person.get("prints") if isinstance(person.get("prints"), dict) else {}
+        stored = [] if replace else self._vector_list(prints.get("campplus"))
         for embedding in embeddings:
             stored.append(np.asarray(embedding, dtype=np.float32))
-        stored = stored[-12:]
-        packed = [[round(float(value), 5) for value in embedding] for embedding in stored]
-        person["prints"] = packed
-        person["embedding"] = packed[0]
-        person["last_seen"] = iso_now()
-        if replace:
-            person["identified"] = True
+        prints = dict(prints)
+        prints["campplus"] = [[round(float(value), 5) for value in embedding] for embedding in stored]
+        person["prints"] = prints
+        person["last"] = time.time()
         self._save()
-        log.info("huellas de %s: %d", person["name"], len(packed))
         return index
 
     def remove_person(self, name: str) -> bool:
         wanted = fold_text(name)
+        removed = [person for person in self.people if fold_text(str(person.get("name") or "")) == wanted]
         kept = [person for person in self.people if fold_text(str(person.get("name") or "")) != wanted]
         if len(kept) == len(self.people):
             return False
+        for person in removed:
+            self._drop_raw(person)
         self.people = kept
         if fold_text(self.locked) == wanted:
             self.locked = ""
@@ -3716,14 +4151,20 @@ class SpeakerBook:
         return found
 
     def accepts(self, embedding: np.ndarray | None) -> bool:
-        """True when nobody is enrolled yet, or this print is an enrolled person."""
-        people = self.identified_people()
-        if not people:
+        """True when the door is open, or this print is the locked voice.
+
+        CampPlus matches at 0.55. A legacy print, with no campplus vectors, stays at 0.30
+        so the person already enrolled is not locked out.
+        """
+        if self.extractor is None or not self.locked:
+            return True
+        person = self._locked_person()
+        if person is None:
             return True
         if embedding is None:
             return False
         vector = np.asarray(embedding, dtype=np.float32)
-        return any(self.best_score(vector, person) >= 0.30 for person in people)
+        return self.best_score(vector, person) >= self.gate(person)
 
 
 _speakers: SpeakerBook | None = None
@@ -3741,11 +4182,10 @@ def allowed_voice(
     audio: np.ndarray | None = None,
     label: str = "",
 ) -> bool:
-    """After enrollment, only an enrolled person's prints are heard."""
+    """After a voice is locked, only that print is heard. A missing model leaves the door open."""
+    del label
     book = speakers()
-    if label and any(str(person.get("name") or "") == label for person in book.identified_people()):
-        return True
-    if not book.identified_people():
+    if book.extractor is None or not book.locked:
         return True
     emb = embedding
     if emb is None and audio is not None:
@@ -3758,6 +4198,14 @@ def allowed_voice(
     elif not ok:
         log.info("no es la voz guardada (%s)", book.locked)
     return ok
+
+
+def enroll_open(embedding: np.ndarray | None, audio: np.ndarray | None = None) -> bool:
+    """identifica mi voz is open until a voice is locked. After that, only that voice."""
+    book = speakers()
+    if book.extractor is None or not book.locked:
+        return True
+    return allowed_voice(embedding, audio)
 
 
 def same_voice(one: np.ndarray | None, other: np.ndarray | None) -> bool:
@@ -3886,10 +4334,11 @@ class VoiceRoom:
                 self.active = None
                 return
         name, index, known = "", -1, 0.0
+        best_person = None
         for person_index, person in enumerate(book.people):
             score = book.best_score(emb, person)
             if score > known:
-                known, name, index = score, str(person["name"]), person_index
+                known, name, index, best_person = score, str(person["name"]), person_index, person
         other_lane = None
         other_score = 0.0
         for lane in self.lanes:
@@ -3905,7 +4354,7 @@ class VoiceRoom:
             self.active = other_lane
             other_lane.embedding = 0.75 * other_lane.embedding + 0.25 * emb
             return
-        if known >= 0.45 and name:
+        if best_person is not None and known >= book.gate(best_person) and name:
             if self.active.label != name:
                 log.info("voz conocida: %s %.2f", name, known)
             self.active.label = name
@@ -3932,11 +4381,13 @@ class VoiceRoom:
                 log.info("mi voz, no la mezclo")
                 return None
         best_i, best_s, best_name = -1, 0.0, ""
+        best_person = None
         for index, person in enumerate(book.people):
             score = book.best_score(emb, person)
             if score > best_s:
                 best_s, best_i, best_name = score, index, str(person["name"])
-        if best_s >= 0.45 and best_name:
+                best_person = person
+        if best_person is not None and best_s >= book.gate(best_person) and best_name:
             for lane in self.lanes:
                 if lane.saved_index == best_i:
                     if lane.embedding is None or getattr(lane.embedding, "shape", None) != emb.shape:
@@ -4069,6 +4520,103 @@ def run_grok_watched(cmd: list[str], env: dict, timeout: int, label: str) -> tup
     return last_out, last_err, last_code
 
 
+TONE_HINTS = {
+    "auto": "Elige el tono según la frase y mantén la misma persona. Serio si importa, pedagógico si están aprendiendo, relajado si es charla.",
+    "professional": "Tono profesional: frases limpias, poco argot, humor escaso.",
+    "serious": "Tono serio: calma, precisión, sin chistes, di la duda si la hay.",
+    "technical": "Tono técnico: el término correcto, la contrapartida y un ejemplo solo si ayuda.",
+    "pedagogical": "Tono pedagógico: primero la idea, luego un ejemplo. Nadie es torpe por preguntar.",
+    "relaxed": "Tono relajado: frases cortas y un poco de coloquial.",
+    "playful": "Tono juguetón: más ritmo, sin convertir cada frase en un chiste.",
+    "direct": "Tono directo: la conclusión primero.",
+    "empathetic": "Tono empático: reconoce la situación sin frase terapéutica y sigue siendo útil.",
+    "creative": "Tono creativo: propone alternativas y conexiones.",
+}
+
+CULTURE_HINTS = {
+    "spain_neutral": "Español de España, actual y sin región marcada. Tú, y un vale o un ojo cuando encaja.",
+    "spain_madrid_urban": "Más directo y con algo de energía urbana. Sin caricatura ni argot forzado.",
+    "spain_andalusian_warmth": "Calidez y comparación expresiva del sur, sin imitar acento ni escribir fonética.",
+    "spain_catalonia_bilingual_context": "Español preciso. No inventes catalanismos.",
+    "latam_neutral": "Español latinoamericano amplio. Ustedes, sin muletillas de España.",
+    "mexico_urban": "Calidez mexicana urbana, con vocabulario local solo si el sabor cultural es alto.",
+    "argentina_rioplatense": "Ritmo rioplatense y voseo solo si el sabor cultural lo permite. Sin estereotipo.",
+    "english_uk": "Ironía seca y subestimación, dichas en español.",
+    "english_us": "Directo y práctico, sin entusiasmo artificial, dicho en español.",
+}
+
+
+def load_personalities() -> list[dict]:
+    try:
+        data = json.loads((ROOT / "personalities.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    rows = data.get("personalities") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict) and row.get("id")]
+
+
+def find_personality(spoken: str) -> dict | None:
+    wanted = _folded_words(spoken)
+    if not wanted:
+        return None
+    for row in load_personalities():
+        if wanted == _folded_words(str(row.get("id") or "")):
+            return row
+        if wanted == _folded_words(str(row.get("name") or "")):
+            return row
+    return None
+
+
+def active_personality(cfg: dict) -> dict | None:
+    pid = str(cfg.get("personality") or "").strip()
+    if not pid:
+        return None
+    for row in load_personalities():
+        if str(row.get("id") or "") == pid:
+            return row
+    return None
+
+
+def personality_block(cfg: dict) -> str:
+    """Spanish persona text appended to the spoken answer. Empty means the usual assistant."""
+    person = active_personality(cfg)
+    if person is None:
+        return ""
+    tone = str(person.get("tone") or "auto")
+    culture = str(person.get("culture") or "spain_neutral")
+    return (
+        f"Persona: {person.get('name')}, {person.get('label')}. {person.get('meaning')}\n"
+        f"Tono: {tone}. {TONE_HINTS.get(tone, TONE_HINTS['auto'])}\n"
+        f"Cultura: {culture}. {CULTURE_HINTS.get(culture, '')}\n"
+        "Rasgos de 0 a 100. Son techos, no una obligación de usarlos siempre: "
+        f"intensidad {person.get('intensity')}, humor {person.get('humor')}, "
+        f"calidez {person.get('warmth')}, franqueza {person.get('directness')}, "
+        f"curiosidad {person.get('curiosity')}, expresividad {person.get('expressiveness')}, "
+        f"lenguaje de calle {person.get('street_language')}, sabor cultural {person.get('culture_intensity')}.\n"
+        f"Verbosidad {person.get('verbosity')}. Formalidad {person.get('formality')}.\n"
+        "Comportamiento, en palabras libres:\n"
+        f"{person.get('behavior')}\n"
+        "La corrección gana a la persona. No digas qué persona ni qué tono estás usando. "
+        "No fuerces un chiste ni una curiosidad. Si el asunto es serio o duele, baja el humor. "
+        "Sigue cabiendo en una o dos frases habladas."
+    )
+
+
+def personality_command(text: str) -> tuple[str, str] | None:
+    """('show', '') or ('set', spoken id or name). Only the eight people in the file."""
+    folded = _folded_words(text)
+    words = folded.split()
+    if not folded or "personalidad" not in words or len(words) > 6:
+        return None
+    rest = re.sub(r"^.*\bpersonalidad\b", "", folded).strip()
+    rest = re.sub(r"^(?:de|del|la|el|un|una)\s+", "", rest).strip()
+    if not rest or rest in {"cual", "que", "activa", "actual", "hay", "tienes"}:
+        return ("show", "")
+    return ("set", rest)
+
+
 def ask_grok(
     text: str,
     cfg: dict,
@@ -4089,6 +4637,9 @@ def ask_grok(
             f" La persona que habla se llama {speaker_name}. "
             "Puedes usar su nombre, sin repetirlo en cada frase."
         )
+    block = personality_block(cfg)
+    if block:
+        prompt += "\n" + block
     if history:
         turns = []
         for role, said in history[-8:]:
@@ -4589,8 +5140,30 @@ def apply_waiting_command(
             speak(speech, f"Voz {shown}. {label}.", speaker)
         display.note_voice(speech)
         return "used"
+    persona = personality_command(text)
+    if persona:
+        kind, wanted = persona
+        if kind == "show":
+            person = active_personality(cfg)
+            if person is None:
+                speak(speech, "Sin personalidad.", speaker)
+            else:
+                speak(speech, f"Personalidad {person.get('name')}.", speaker)
+        else:
+            found = find_personality(wanted)
+            if found is None:
+                speak(speech, "No tengo esa personalidad.", speaker)
+            else:
+                cfg["personality"] = str(found.get("id") or "")
+                save_user_config({"personality": cfg["personality"]})
+                speak(speech, f"Personalidad {found.get('name')}.", speaker)
+        return "used"
     picked = asr_choice(text)
     if picked:
+        if picked != "next" and picked not in {item["id"] for item in available_asrs()}:
+            missing = next((item["label"] for item in asr_catalog() if item["id"] == picked), picked)
+            speak(speech, f"{missing} no está. Sigo con {speech.asr_label}.", speaker)
+            return "used"
         label = speech.cycle_asr() if picked == "next" else speech._select_asr(picked)
         display.set_asr_name(speech.asr_label)
         names = ", ".join(item["label"] for item in available_asrs())
@@ -4771,7 +5344,10 @@ def listen_spanish(
                 continue
             audio = np.concatenate(lane.audio) if lane.audio else None
             heard = command_body(lane.text) or lane.text
-            if not is_voice_enroll(heard) and not allowed_voice(lane.embedding, audio, lane.label):
+            if is_voice_enroll(heard):
+                if not enroll_open(lane.embedding, audio):
+                    continue
+            elif not allowed_voice(lane.embedding, audio, lane.label):
                 continue
             log.info("hola, sin búsqueda: %s", lane.text)
             if not display.listening:
@@ -4788,7 +5364,12 @@ def listen_spanish(
             order_text = command_body(text)
             if order_text is None:
                 order_text = text
-            if not is_voice_enroll(order_text) and not allowed_voice(embedding, audio, label):
+            if is_voice_enroll(order_text):
+                if not enroll_open(embedding, audio):
+                    sticky = f"{label}: {text}"
+                    display.update(sticky, level)
+                    continue
+            elif not allowed_voice(embedding, audio, label):
                 sticky = f"{label}: {text}"
                 display.update(sticky, level)
                 continue
@@ -5485,8 +6066,8 @@ def _wait_owner(
             _kind, label, text, audio, embedding, _saved = event
             heard_order = command_body(text) or text
             if is_voice_enroll(heard_order):
-                mine = True
-            elif speakers().identified_people():
+                mine = enroll_open(embedding, audio)
+            elif speakers().locked:
                 mine = embedding is not None and speakers().accepts(embedding)
             else:
                 mine = same_voice(embedding, owner)
