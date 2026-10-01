@@ -3724,7 +3724,10 @@ def run_voice_enrollment(
     """Sixteen phrases, once. One CampPlus print, then a score for each installed engine."""
     book = speakers()
     if book.extractor is None:
-        speak(speech, "No tengo el modelo de voces.", speaker)
+        if SPEAKER_MODEL.is_file():
+            log.error("CampPlus no arrancó; el modelo está en disco: %s", SPEAKER_MODEL.name)
+        else:
+            speak(speech, "No tengo el modelo de voces.", speaker)
         return
     name = _enroll_choose_name(speech, mic, floor, cfg, display, speaker, speaker_embedding)
     if not name:
@@ -3867,7 +3870,7 @@ class SpeakerBook:
 
             config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
                 model=str(SPEAKER_MODEL),
-                num_threads=2,
+                num_threads=1,
                 debug=False,
                 provider="cpu",
             )
@@ -3961,19 +3964,23 @@ class SpeakerBook:
             audio = audio / 32768.0
         if sample_rate != RATE:
             audio = resample(audio, sample_rate, RATE)
-        if audio.size < int(RATE * 0.6):
+        if audio.size < int(RATE * 0.5):
             return None
-        return audio
+        return np.ascontiguousarray(audio, dtype=np.float32)
 
     def _embed_wave(self, audio: np.ndarray) -> np.ndarray | None:
+        """One 192-float CampPlus vector, or nothing when the take is too short."""
         if self.extractor is None:
             return None
         stream = self.extractor.create_stream()
-        stream.accept_waveform(sample_rate=RATE, waveform=audio)
+        stream.accept_waveform(16000, audio)
         stream.input_finished()
         if not self.extractor.is_ready(stream):
             return None
-        return np.array(self.extractor.compute(stream), dtype=np.float32)
+        vector = np.asarray(self.extractor.compute(stream), dtype=np.float32).reshape(-1)
+        if vector.size != 192:
+            return None
+        return vector
 
     def remember_self(self, samples: np.ndarray, sample_rate: int) -> None:
         audio = self._wave(samples, sample_rate)
