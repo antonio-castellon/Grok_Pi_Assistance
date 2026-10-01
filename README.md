@@ -1,8 +1,20 @@
+![Grok mark, with Assistance underneath, a Raspberry Pi 4 on the left and a Raspberry Pi 5 on the right](docs/img/banner.svg)
+
 # Grok Pi Assistance
 
-Spanish voice assistant for a Raspberry Pi. It listens and speaks on the sound devices Raspberry Pi OS already selected, and it draws on the framebuffer the OS assigned (`fb0`). Exact local orders run on the Pi. Questions go to Grok in the cloud. There is no on-device Grok model.
+This is a voice companion for the moments when reading is difficult and the house is quiet. A Raspberry Pi 4 with 4 GB of RAM is enough to run it as its own small device, and a Raspberry Pi 5 is the same assistant on a newer board, for a family that would rather not leave a laptop open. The microphone can stay ready. The audio stays on the Pi. Only text that was meant for the assistant is sent out.
 
-The behavior of the running program is in [PI_ASSISTANCE_GROK.md](PI_ASSISTANCE_GROK.md). The desktop tray app is the separate repository [antonio-castellon/grok_assistant](https://github.com/antonio-castellon/grok_assistant).
+I spent years waiting for the Amazon Echo to become a better listener. It never really became more than a speaker with a light ring, so I decided to build my own.
+
+In my case, that person is my father. His eyesight is limited, and he spends many hours on his own. I wanted him to have a voice he could simply talk to — one that could answer questions and explain things without making him find a screen or read small text. That is now possible. Grok on this machine is also the foundation for the features and integrations I plan to add next.
+
+While the program is running, it can keep listening. Speech is turned into text on the Pi. Grok only receives text when the assistant has actually been addressed: after a greeting, for a question, for a command beginning with `comando`, or when someone asks for a song. Ordinary conversation stays on the device. If a command is unclear or misheard, Grok can help interpret it, but the assistant still asks for a `sí` before doing anything.
+
+The voice on this Pi is Spanish, because that is the language it was built and tested in. There is no on-device Grok model. Questions go to Grok in the cloud. Exact local orders run on the Pi.
+
+The picture is the framebuffer Raspberry Pi OS already assigned (`fb0`). Playback and the microphone are the ALSA devices the operating system already selected. This project does not configure HDMI, the screen, or a sound card.
+
+The desktop tray app, for a computer that is already nearby, is the separate repository [antonio-castellon/grok_assistant](https://github.com/antonio-castellon/grok_assistant). How this Pi listens, and how to reproduce it, is in [PI_ASSISTANCE_GROK.md](PI_ASSISTANCE_GROK.md).
 
 ## Clean install
 
