@@ -436,7 +436,7 @@ ENROLL_VOICE_RMS = 0.004
 ENROLL_MIN_VOICE = 0.8
 ENROLL_SILENCE = 1.0
 ENROLL_MAX_VOICE = 8.0
-ENROLL_MAX_WAIT = 12.0
+ENROLL_MAX_WAIT = 12.0  # name and yes/no only. A phrase waits for seguir or salir.
 
 
 def _discard_queued(mic: Mic) -> None:
@@ -543,7 +543,7 @@ def _enroll_listen(
     speaker: str,
     prompt: str,
 ) -> tuple[str, np.ndarray | None]:
-    """Use the capture device that is already open. The high beep starts with the take."""
+    """Name and yes/no on the capture device that is already open."""
     if not mic.ensure_open():
         return "", None
     _pause_and_clear(mic, 0.1)
@@ -552,6 +552,125 @@ def _enroll_listen(
     _discard_queued(mic)
     _play_tone(494, 0.22, speaker, block=True)
     return heard, audio
+
+
+def enroll_decision(text: str) -> str:
+    """seguir, salir, or nothing. One short word, one edit still counts."""
+    words = [
+        word
+        for word in A._folded_words(text).split()
+        if word not in {"por", "favor", "vale", "ok"}
+    ]
+    if len(words) != 1:
+        return ""
+    word = words[0]
+    best = ""
+    best_distance = 2
+    for target, kind in (("salir", "salir"), ("siguiente", "seguir"), ("seguir", "seguir")):
+        distance = A._edit_distance(word, target)
+        if distance < best_distance:
+            best = kind
+            best_distance = distance
+    return best
+
+
+def split_phrase_decision(
+    heard: str, audio: np.ndarray | None
+) -> tuple[str, np.ndarray | None, str]:
+    """A lone seguir or salir is the decision. It is not phrase audio."""
+    decision = enroll_decision(heard)
+    if decision:
+        return "", None, decision
+    return heard, audio, ""
+
+
+def enroll_followup(decision: str, has_samples: bool, has_vector: bool, text: str) -> str:
+    """empty, keep, miss, or salir. An empty seguir is not a failure."""
+    if decision == "salir":
+        return "salir"
+    if decision != "seguir":
+        return "wait"
+    if not has_samples and not text.strip():
+        return "empty"
+    if has_samples and has_vector:
+        return "keep"
+    return "miss"
+
+
+def _capture_until_pause(
+    speech: Speech,
+    mic: Mic,
+    display: HeardDisplay,
+    prompt: str,
+    keep_audio: bool,
+) -> tuple[str, np.ndarray | None, bool]:
+    """Read the open mic until speech stops, or until 8 seconds of voice.
+
+    The pause freezes the buffer. It does not choose the next phrase.
+    There is no 12 second give-up. False means the microphone closed.
+    """
+    stream = speech.new_stream()
+    voice: list[np.ndarray] = []
+    voice_s = 0.0
+    quiet_s = 0.0
+    text = ""
+    step = A.CHUNK_FRAMES / A.RATE
+    display.update(f"DI: {prompt}   OI:", display.level)
+    while not A.STOP:
+        if not display.listening:
+            return "", None, False
+        block = mic.read_frames()
+        if block is None:
+            return text, None, False
+        level = A.rms(block)
+        heard = (speech.feed_spanish(stream, block) or "").strip()
+        if heard:
+            text = heard
+        display.update(f"DI: {prompt}   OI: {text}", level)
+        loud = level > ENROLL_VOICE_RMS
+        if loud and voice_s < ENROLL_MAX_VOICE:
+            if keep_audio:
+                voice.append(np.array(block, copy=True))
+            voice_s += step
+            quiet_s = 0.0
+        elif voice_s > 0:
+            quiet_s += step
+        if voice_s >= ENROLL_MAX_VOICE:
+            break
+        if voice_s > 0 and quiet_s >= ENROLL_SILENCE:
+            break
+    final = (speech.finish_spanish(stream) or text).strip()
+    display.update(f"DI: {prompt}   OI: {final}", display.level)
+    if not keep_audio or voice_s < ENROLL_MIN_VOICE or not voice:
+        return final, None, True
+    return final, np.concatenate(voice), True
+
+
+def _enroll_phrase(
+    speech: Speech,
+    mic: Mic,
+    display: HeardDisplay,
+    prompt: str,
+) -> tuple[str, np.ndarray | None, bool]:
+    """The phrase wav. Silence or 8 seconds only freezes it."""
+    return _capture_until_pause(speech, mic, display, prompt, True)
+
+
+def _enroll_choice(
+    speech: Speech,
+    mic: Mic,
+    display: HeardDisplay,
+    prompt: str,
+) -> str:
+    """A later short utterance: seguir, siguiente, or salir. Not part of the wav."""
+    while not A.STOP and display.listening:
+        heard, _audio, alive = _capture_until_pause(speech, mic, display, prompt, False)
+        if not alive:
+            return ""
+        decision = enroll_decision(heard)
+        if decision:
+            return decision
+    return ""
 
 
 def enroll_result(has_samples: bool, has_vector: bool, text: str) -> str:
