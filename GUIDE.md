@@ -13,7 +13,7 @@ From top to bottom, that picture is:
 - The Grok mark. A tap on it turns listening off and on, except while a song is audible.
 - **Volumen**, then the recognizer name. On the right: memory, CPU, disk, and CPU temperature. The volume line shows a percent of the system mixer. A dash means that mixer did not report a playback level.
 - **Voz 1/9** and the voice name. On the right, Wi-Fi and the address, when the link is up.
-- The operating system line.
+- The operating system line. At the end of that same line, the build that is running (`build` and seven characters). When this copy matches the published one, those characters are that commit.
 - How a talk starts and ends, then **COMANDOS**. The word `comando` is written once, on that header. The lines under it do not repeat it.
 - The status. **ESPERANDO** means it is listening and no talk is open. **CONVERSACIÓN** means a talk is open. **BUSCANDO** means a cloud answer is in progress. **PAUSA** means listening is off. **PRUEBA** means it is only showing what it hears. The model name sits on the right of that row.
 - The bottom line. **(silencio)** is the idle line. While someone is speaking it stays on **escuchando…** and then shows the words. It does not jump back to silencio on every empty gap.

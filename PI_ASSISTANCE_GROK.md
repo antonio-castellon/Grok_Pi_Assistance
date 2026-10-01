@@ -231,7 +231,7 @@ Do not `pkill` a pattern that matches the command line of the shell you are in. 
 
 Touch uses the minimum and maximum the kernel reports for X and Y, mapped onto that framebuffer. Music pause and stop are the top-left buttons of whatever picture the OS is showing.
 
-The picture is: logo, then a row with volume, the recognizer name, and right-aligned `MEM`, `CPU`, `DISCO`, and `TEMP`. Temperature is only `cpu-thermal`, shown as `53°`. Then the voice row and, on the right, Wi-Fi status from `iw dev wlan0 link` and `ip -4 addr`. Then the command list. The heard line is at the bottom.
+The picture is: logo, then a row with volume, the recognizer name, and right-aligned `MEM`, `CPU`, `DISCO`, and `TEMP`. Temperature is only `cpu-thermal`, shown as `53°`. Then the voice row and, on the right, Wi-Fi status from `iw dev wlan0 link` and `ip -4 addr`. Then the operating-system row. Its text is the pretty name from `/etc/os-release`, the kernel release up to the first `+`, and the machine. At the end of that same row, in the small font, is `build` plus seven characters. Those characters are the published `main` commit when `assistant.py` and `pi_extra.py` match that commit. Otherwise they are a hash of the two files on this disk, so the screen still shows the copy that is running. The journal line is `build` and those seven characters. Then the command list. The heard line is at the bottom.
 
 Spanish glyphs come from the PSF unicode table. A Latin-15 identity map draws the wrong accents. Do not replace that loader.
 
