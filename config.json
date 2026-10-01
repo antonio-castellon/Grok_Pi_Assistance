@@ -2,6 +2,7 @@
   "language": "es",
   "admin_key": "",
   "personality": "",
+  "assistant_name": "Grok",
   "playback_device": "auto",
   "capture_device": "auto",
   "wake_phrases": ["despierta grok"],

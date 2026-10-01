@@ -20,9 +20,9 @@ From top to bottom, that picture is:
 
 ## Start and stop a talk
 
-Say **hola grok**. It answers «Hola.» and waits. It does not search those words and it does not send them anywhere.
+Say **hola grok**. It answers «Hola.» and waits. It does not search those words and it does not send them anywhere. `comando nombre Miguel` changes that call to **hola Miguel**. **hola grok** still opens a talk.
 
-**¿estás ahí, Grok?** and **Grok, ¿estás ahí?** are answered «Sí, aquí estoy.» A short **hola** on its own also opens a talk. **ok grok** and **despierta grok** do not.
+**¿estás ahí, Grok?** and **Grok, ¿estás ahí?** are answered «Sí, aquí estoy.» With another name, **¿estás ahí, Miguel?** does the same. A short **hola** on its own also opens a talk. **ok grok** and **despierta grok** do not.
 
 **gracias** alone is answered «De nada.» and the talk ends. **vale** alone is answered «Vale.» and the talk ends. You do not say `comando` for those.
 
@@ -48,6 +48,8 @@ Say `comando` and then the line.
 | reconocedor kroko, whisper, base, small, or canary | That engine. If its folder is missing, the assistant says so and keeps the current one. |
 | personalidad | The active personality, or «Sin personalidad.» |
 | personalidad vega | One of alex, vega, nico, lucia, marcos, ines, bruno, carmen. The id or the name both work. |
+| nombre | The name it answers to, and «hola» plus that name. |
+| nombre Miguel | From now on the call is «hola Miguel». A short Spanish name is easier for the Spanish ear than the English word Grok. |
 | pon la canción X | Plays the audio of a YouTube match. The microphone stays off while it is audible. |
 | para la música | Stops the song. |
 | apaga el dispositivo | Asks «¿Apago el dispositivo? Di sí o no.» Only a yes from the locked voice powers the Pi off. |
@@ -60,7 +62,7 @@ Say `comando` and then the line.
 
 `comando identifica mi voz` is spoken, so you do not have to read the panel. It asks «¿Cómo te llamas?» Two words, such as Jose Antonio, are one person. A saved voice or a saved name is replaced only after a yes. A new name is stored only after a yes. `salir` cancels at any moment.
 
-It then says it will record sixteen phrases once, that it keeps the raw sound without checking the words, and that you should speak after the beep and wait for the second beep. Each phrase follows as “1 de 16. hola grok”, then “2 de 16. estás ahí”, and so on. A high beep starts the take. A low beep ends it. Speak after the first and wait for the second. The bottom line shows `DI:` for the phrase and `OI:` for what it heard. The words do not have to match. What is kept is the sound. If it hears words but cannot take the voice print, it asks for that same phrase again. Three misses in a row stop.
+It then says it will record sixteen phrases once, that it keeps the raw sound without checking the words, and that you should speak after the beep and wait for the second beep. The first phrase is “1 de 16. hola” plus the name it answers to. That is “hola grok” until `comando nombre` sets another one, for example “hola Miguel”. The Spanish ear has more trouble with the English word Grok than with a Spanish name. The rest follow as “2 de 16. estás ahí”, and so on. A high beep starts the take. A low beep ends it. Speak after the first and wait for the second. The bottom line shows `DI:` for the phrase and `OI:` for what it heard. The words do not have to match. What is kept is the sound. If it hears words but cannot take the voice print, it asks for that same phrase again. Three misses in a row stop.
 
 When it finishes, that name is the only voice it will hear: the wake, every `comando`, yes and no, and the open talk. Someone else saying «hola grok» gets nothing. Only that voice can identify again. Other saved names stay in the file. An administrator can list them or delete one.
 
